@@ -418,11 +418,12 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
             return None
         return volume_type['name']
 
-    def _remove_destroy(self, lun):
+    def _remove_destroy(self, name, project):
         """
         Remove the LUN from the dataset and destroy the actual LUN on the
         storage system.
         """
+        lun = self._lookup_lun_for_volume(name, project)
         member = self.client.factory.create('DatasetMemberParameter')
         member.ObjectNameOrId = lun.id
         members = self.client.factory.create('ArrayOfDatasetMemberParameter')
@@ -485,8 +486,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         """Driver entry point for destroying existing volumes."""
         name = volume['name']
         project = volume['project_id']
-        lun = self._lookup_lun_for_volume(name, project)
-        self._remove_destroy(lun)
+        self._remove_destroy(name, project)
 
     def _get_lun_details(self, lun_id):
         """Given the ID of a LUN, get the details about that LUN."""
@@ -618,7 +618,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
                 'linux' != igroup_info['initiator-group-os-type'][0]):
                 continue
             igroup_name = igroup_info['initiator-group-name'][0]
-            if not igroup_name.startswith(IGROUP_PREFIX):
+            if not igroup_name.startswith(self.IGROUP_PREFIX):
                 continue
             initiators = igroup_info['initiators'][0]['initiator-info']
             for initiator in initiators:
@@ -632,7 +632,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         the given iSCSI initiator. The group will only have 1 member and will
         be named "openstack-${initiator_name}".
         """
-        igroup_name = IGROUP_PREFIX + initiator_name
+        igroup_name = self.IGROUP_PREFIX + initiator_name
         request = self.client.factory.create('Request')
         request.Name = 'igroup-create'
         igroup_create_xml = (
