@@ -109,19 +109,23 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
             msg = _('API %(name)s failed: %(reason)s')
             raise exception.NovaException(msg % locals())
 
-    def _create_client(self, wsdl_url, login, password, hostname, port):
+    def _create_client(self, wsdl_url, cache, login, password, hostname, port):
         """
         Instantiate a "suds" client to make web services calls to the
         DFM server. Note that the WSDL file is quite large and may take
         a few seconds to parse.
         """
         LOG.debug('Using WSDL: %s' % wsdl_url)
-        self.client = client.Client(wsdl_url,
-                                    username=login,
-                                    password=password)
+        if cache:
+            self.client = client.Client(wsdl_url, username=login,
+                                        password=password)
+        else:
+            self.client = client.Client(wsdl_url, username=login,
+                                        password=password, cache=None)
         soap_url = 'http://%s:%s/apis/soap/v1' % (hostname, port)
         LOG.debug('Using DFM server: %s' % soap_url)
         self.client.set_options(location=soap_url)
+        
 
     def _set_storage_service(self, storage_service):
         """Set the storage service to use for provisioning."""
@@ -157,7 +161,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         client.
         """
         self._check_flags()
-        self._create_client(FLAGS.netapp_wsdl_url, FLAGS.netapp_login,
+        self._create_client(FLAGS.netapp_wsdl_url, True, FLAGS.netapp_login,
             FLAGS.netapp_password, FLAGS.netapp_server_hostname,
             FLAGS.netapp_server_port)
         self._set_storage_service(FLAGS.netapp_storage_service)
