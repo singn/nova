@@ -125,7 +125,6 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         soap_url = 'http://%s:%s/apis/soap/v1' % (hostname, port)
         LOG.debug('Using DFM server: %s' % soap_url)
         self.client.set_options(location=soap_url)
-        
 
     def _set_storage_service(self, storage_service):
         """Set the storage service to use for provisioning."""
