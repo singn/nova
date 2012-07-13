@@ -72,7 +72,7 @@ FLAGS = flags.FLAGS
 FLAGS.register_opts(netapp_opts)
 
 
-class DfmDataset:
+class DfmDataset(object):
     def __init__(self, id, name, project, type):
         self.id = id
         self.name = name
@@ -80,7 +80,7 @@ class DfmDataset:
         self.type = type
 
 
-class DfmLun:
+class DfmLun(object):
     def __init__(self, dataset, lunpath, id):
         self.dataset = dataset
         self.lunpath = lunpath
@@ -269,7 +269,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
                                                             Maximum=100)
                 if not hasattr(res, 'ProgressEvents'):
                     break
-                event_list.extend(res.ProgressEvents.DpJobProgressEventInfo)
+                event_list += res.ProgressEvents.DpJobProgressEventInfo
         finally:
             server.DpJobProgressEventListIterEnd(Tag=tag)
         return event_list
@@ -293,11 +293,11 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         """
         Return the dataset name for a given project and volume type.
         """
-        _project = string.replace(string.replace(project, ' ', '_'), '-', '_')
+        _project = project.replace(' ', '_').replace('-', '_')
         dataset_name = self.DATASET_PREFIX + _project
         if not ss_type:
             return dataset_name
-        _type = string.replace(string.replace(ss_type, ' ', '_'), '-', '_')
+        _type = ss_type.replace(' ', '_').replace('-', '_')
         return dataset_name + '_' + _type
 
     def _get_dataset(self, dataset_name):
