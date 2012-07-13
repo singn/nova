@@ -16,8 +16,8 @@
 #    under the License.
 
 from nova import flags
-from nova import log as logging
 from nova.network import linux_net
+from nova.openstack.common import log as logging
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ class LinuxNetL3(L3Driver):
         self.initialized = True
 
     def is_initialized(self):
-        return self.initialized == True
+        return self.initialized
 
     def initialize_network(self, cidr):
         linux_net.add_snat_rule(cidr)

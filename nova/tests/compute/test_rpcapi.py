@@ -21,7 +21,7 @@ Unit Tests for nova.compute.rpcapi
 from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova import flags
-from nova import rpc
+from nova.openstack.common import rpc
 from nova import test
 
 
@@ -44,9 +44,15 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def _test_compute_api(self, method, rpc_method, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
-        rpcapi = compute_rpcapi.ComputeAPI()
+        if 'rpcapi_class' in kwargs:
+            rpcapi_class = kwargs['rpcapi_class']
+            del kwargs['rpcapi_class']
+        else:
+            rpcapi_class = compute_rpcapi.ComputeAPI
+        rpcapi = rpcapi_class()
         expected_retval = 'foo' if method == 'call' else None
 
+        expected_version = kwargs.pop('version', rpcapi.BASE_RPC_API_VERSION)
         expected_msg = rpcapi.make_msg(method, **kwargs)
         if 'host_param' in expected_msg['args']:
             host_param = expected_msg['args']['host_param']
@@ -65,7 +71,7 @@ class ComputeRpcAPITestCase(test.TestCase):
                 expected_msg['args']['instance_name'] = instance['name']
             else:
                 expected_msg['args']['instance_uuid'] = instance['uuid']
-        expected_msg['version'] = rpcapi.RPC_API_VERSION
+        expected_msg['version'] = expected_version
 
         cast_and_call = ['confirm_resize', 'stop_instance']
         if rpc_method == 'call' and method in cast_and_call:
@@ -224,10 +230,12 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_refresh_security_group_rules(self):
         self._test_compute_api('refresh_security_group_rules', 'cast',
+                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
                 security_group_id='id', host='host')
 
     def test_refresh_security_group_members(self):
         self._test_compute_api('refresh_security_group_members', 'cast',
+                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
                 security_group_id='id', host='host')
 
     def test_remove_aggregate_host(self):
@@ -273,6 +281,10 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_set_host_enabled(self):
         self._test_compute_api('set_host_enabled', 'call',
                 enabled='enabled', host='host')
+
+    def test_get_host_uptime(self):
+        self._test_compute_api('get_host_uptime', 'call', host='host',
+                version='1.1')
 
     def test_snapshot_instance(self):
         self._test_compute_api('snapshot_instance', 'cast',

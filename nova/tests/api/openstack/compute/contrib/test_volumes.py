@@ -25,9 +25,9 @@ from nova import context
 import nova.db
 from nova import flags
 from nova.openstack.common import jsonutils
+from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.api.openstack import fakes
-from nova import utils
 from nova import volume
 from webob import exc
 
@@ -138,8 +138,6 @@ def return_volume(context, volume_id):
 class VolumeApiTest(test.TestCase):
     def setUp(self):
         super(VolumeApiTest, self).setUp()
-        fakes.FakeAuthManager.reset_fake_data()
-        fakes.FakeAuthDatabase.data = {}
         fakes.stub_out_networking(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
         self.stubs.Set(nova.db, 'volume_get', return_volume)
@@ -364,7 +362,7 @@ class VolumeSerializerTest(test.TestCase):
             status='vol_status',
             size=1024,
             availabilityZone='vol_availability',
-            createdAt=utils.utcnow(),
+            createdAt=timeutils.utcnow(),
             attachments=[dict(
                     id='vol_id',
                     volumeId='vol_id',
@@ -393,7 +391,7 @@ class VolumeSerializerTest(test.TestCase):
                 status='vol1_status',
                 size=1024,
                 availabilityZone='vol1_availability',
-                createdAt=utils.utcnow(),
+                createdAt=timeutils.utcnow(),
                 attachments=[dict(
                         id='vol1_id',
                         volumeId='vol1_id',
@@ -413,7 +411,7 @@ class VolumeSerializerTest(test.TestCase):
                 status='vol2_status',
                 size=1024,
                 availabilityZone='vol2_availability',
-                createdAt=utils.utcnow(),
+                createdAt=timeutils.utcnow(),
                 attachments=[dict(
                         id='vol2_id',
                         volumeId='vol2_id',

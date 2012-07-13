@@ -23,12 +23,12 @@ from nova import context
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.network import manager
 from nova.network.quantum import melange_ipam_lib
 from nova.network.quantum import quantum_connection
 from nova.openstack.common import cfg
-from nova import rpc
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
 from nova import utils
 
 LOG = logging.getLogger(__name__)

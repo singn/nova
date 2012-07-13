@@ -21,7 +21,7 @@ Unit Tests for nova.console.rpcapi
 from nova.console import rpcapi as console_rpcapi
 from nova import context
 from nova import flags
-from nova import rpc
+from nova.openstack.common import rpc
 from nova import test
 
 
@@ -40,7 +40,7 @@ class ConsoleRpcAPITestCase(test.TestCase):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = console_rpcapi.ConsoleAPI()
         expected_msg = rpcapi.make_msg(method, **kwargs)
-        expected_msg['version'] = rpcapi.RPC_API_VERSION
+        expected_msg['version'] = rpcapi.BASE_RPC_API_VERSION
 
         self.cast_ctxt = None
         self.cast_topic = None

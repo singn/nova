@@ -32,13 +32,12 @@ import nose.plugins.skip
 import stubout
 
 from nova import flags
-import nova.image.fake
-from nova import log as logging
 from nova.openstack.common import cfg
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import service
 from nova import tests
 from nova.tests import fake_flags
-from nova import utils
 from nova.virt import fake
 
 
@@ -131,7 +130,7 @@ class TestCase(unittest.TestCase):
         # NOTE(vish): We need a better method for creating fixtures for tests
         #             now that we have some required db setup for the system
         #             to work properly.
-        self.start = utils.utcnow()
+        self.start = timeutils.utcnow()
         tests.reset_db()
 
         # emulate some of the mox stuff, we can't use the metaclass
@@ -150,9 +149,6 @@ class TestCase(unittest.TestCase):
             self.mox.VerifyAll()
             super(TestCase, self).tearDown()
         finally:
-            if FLAGS.image_service == 'nova.image.fake.FakeImageService':
-                nova.image.fake.FakeImageService_reset()
-
             # Reset any overridden flags
             FLAGS.reset()
 
@@ -316,3 +312,12 @@ class TestCase(unittest.TestCase):
                 raise AssertionError(exc_msg)
             except Exception:
                 pass  # Any other errors are fine
+
+    def assertIsInstance(self, a, b, *args, **kwargs):
+        """Python < v2.7 compatibility.  Assert 'a' is Instance of 'b'"""
+        try:
+            f = super(TestCase, self).assertIsInstance
+        except AttributeError:
+            self.assertTrue(isinstance(a, b), *args, **kwargs)
+        else:
+            f(a, b, *args, **kwargs)

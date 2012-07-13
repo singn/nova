@@ -23,10 +23,10 @@ import UserDict
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.openstack.common import cfg
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova.scheduler import filters
-from nova import utils
 
 
 host_manager_opts = [
@@ -124,7 +124,9 @@ class HostState(object):
             all_disk_mb -= FLAGS.reserved_host_disk_mb
         if FLAGS.reserved_host_memory_mb > 0:
             all_ram_mb -= FLAGS.reserved_host_memory_mb
+        #NOTE(jogo) free_ram_mb can be negative
         self.free_ram_mb = all_ram_mb
+        self.total_usable_ram_mb = all_ram_mb
         self.free_disk_mb = all_disk_mb
         self.vcpus_total = vcpus_total
 
@@ -274,7 +276,7 @@ class HostManager(object):
         service_caps = self.service_states.get(host, {})
         # Copy the capabilities, so we don't modify the original dict
         capab_copy = dict(capabilities)
-        capab_copy["timestamp"] = utils.utcnow()  # Reported time
+        capab_copy["timestamp"] = timeutils.utcnow()  # Reported time
         service_caps[service_name] = capab_copy
         self.service_states[host] = service_caps
 
@@ -282,7 +284,7 @@ class HostManager(object):
         """Check if host service capabilites are not recent enough."""
         allowed_time_diff = FLAGS.periodic_interval * 3
         caps = self.service_states[host][service]
-        if ((utils.utcnow() - caps["timestamp"]) <=
+        if ((timeutils.utcnow() - caps["timestamp"]) <=
             datetime.timedelta(seconds=allowed_time_diff)):
             return False
         return True
@@ -331,7 +333,8 @@ class HostManager(object):
             host_state_map[host] = host_state
 
         # "Consume" resources from the host the instance resides on.
-        instances = db.instance_get_all(context)
+        instances = db.instance_get_all(context,
+                columns_to_join=['instance_type'])
         for instance in instances:
             host = instance['host']
             if not host:

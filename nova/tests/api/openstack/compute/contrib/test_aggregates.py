@@ -20,7 +20,7 @@ from webob import exc
 from nova.api.openstack.compute.contrib import aggregates
 from nova import context
 from nova import exception
-from nova import log as logging
+from nova.openstack.common import log as logging
 from nova import test
 
 
@@ -52,7 +52,7 @@ class AggregateTestCase(test.TestCase):
 
     def test_index(self):
         def stub_list_aggregates(context):
-            if context == None:
+            if context is None:
                 raise Exception()
             return AGGREGATE_LIST
         self.stubs.Set(self.controller.api, 'get_aggregate_list',

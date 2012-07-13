@@ -31,14 +31,14 @@ from nova.api.openstack.compute import limits
 from nova.api.openstack.compute import versions
 from nova.api.openstack import urlmap
 from nova.api.openstack import wsgi as os_wsgi
-import nova.auth.manager as auth_manager
 from nova.compute import instance_types
 from nova.compute import vm_states
 from nova import context
 from nova.db.sqlalchemy import models
 from nova import exception as exc
-import nova.image.fake
+import nova.image.glance
 from nova.openstack.common import jsonutils
+from nova.openstack.common import timeutils
 from nova import quota
 from nova.tests import fake_network
 from nova.tests.glance import stubs as glance_stubs
@@ -67,13 +67,6 @@ class FakeRouter(wsgi.Router):
         res.status = '200'
         res.headers['X-Test-Success'] = 'True'
         return res
-
-
-def fake_auth_init(self, application):
-    self.db = FakeAuthDatabase()
-    self.context = Context()
-    self.auth = FakeAuthManager()
-    self.application = application
 
 
 @webob.dec.wsgify
@@ -122,14 +115,6 @@ def stub_out_key_pair_funcs(stubs, have_key_pair=True):
         stubs.Set(nova.db, 'key_pair_get', one_key_pair)
     else:
         stubs.Set(nova.db, 'key_pair_get_all_by_user', no_key_pair)
-
-
-def stub_out_image_service(stubs):
-    def fake_get_image_service(context, image_href):
-        return (nova.image.fake.FakeImageService(), image_href)
-    stubs.Set(nova.image, 'get_image_service', fake_get_image_service)
-    stubs.Set(nova.image, 'get_default_image_service',
-        lambda: nova.image.fake.FakeImageService())
 
 
 def stub_out_rate_limiting(stubs):
@@ -275,10 +260,12 @@ def stub_out_glance_add_image(stubs, sent_to_glance):
 
 
 def stub_out_glance(stubs):
-    def fake_get_image_service():
+    def fake_get_remote_image_service():
         client = glance_stubs.StubGlanceClient(_make_image_fixtures())
         return nova.image.glance.GlanceImageService(client)
-    stubs.Set(nova.image, 'get_default_image_service', fake_get_image_service)
+    stubs.Set(nova.image.glance,
+              'get_default_image_service',
+              fake_get_remote_image_service)
 
 
 class FakeToken(object):
@@ -300,13 +287,13 @@ class FakeRequestContext(context.RequestContext):
         return super(FakeRequestContext, self).__init__(*args, **kwargs)
 
 
-class HTTPRequest(webob.Request):
+class HTTPRequest(os_wsgi.Request):
 
     @classmethod
     def blank(cls, *args, **kwargs):
         kwargs['base_url'] = 'http://localhost/v2'
         use_admin_context = kwargs.pop('use_admin_context', False)
-        out = webob.Request.blank(*args, **kwargs)
+        out = os_wsgi.Request.blank(*args, **kwargs)
         out.environ['nova.context'] = FakeRequestContext('fake_user', 'fake',
                 is_admin=use_admin_context)
         return out
@@ -329,7 +316,7 @@ class FakeAuthDatabase(object):
 
     @staticmethod
     def auth_token_create(context, token):
-        fake_token = FakeToken(created_at=utils.utcnow(), **token)
+        fake_token = FakeToken(created_at=timeutils.utcnow(), **token)
         FakeAuthDatabase.data[fake_token.token_hash] = fake_token
         FakeAuthDatabase.data['id_%i' % fake_token.id] = fake_token
         return fake_token
@@ -340,112 +327,6 @@ class FakeAuthDatabase(object):
         if token and token.token_hash in FakeAuthDatabase.data:
             del FakeAuthDatabase.data[token.token_hash]
             del FakeAuthDatabase.data['id_%i' % token_id]
-
-
-class FakeAuthManager(object):
-    #NOTE(justinsb): Accessing static variables through instances is FUBAR
-    #NOTE(justinsb): This should also be private!
-    auth_data = []
-    projects = {}
-
-    @classmethod
-    def clear_fakes(cls):
-        cls.auth_data = []
-        cls.projects = {}
-
-    @classmethod
-    def reset_fake_data(cls):
-        u1 = auth_manager.User('id1', 'guy1', 'acc1', 'secret1', False)
-        cls.auth_data = [u1]
-        cls.projects = dict(testacct=auth_manager.Project('testacct',
-                                             'testacct',
-                                             'id1',
-                                             'test',
-                                              []))
-
-    def add_user(self, user):
-        FakeAuthManager.auth_data.append(user)
-
-    def get_users(self):
-        return FakeAuthManager.auth_data
-
-    def get_user(self, uid):
-        for user in FakeAuthManager.auth_data:
-            if user.id == uid:
-                return user
-        return None
-
-    def get_user_from_access_key(self, key):
-        for user in FakeAuthManager.auth_data:
-            if user.access == key:
-                return user
-        return None
-
-    def delete_user(self, uid):
-        for user in FakeAuthManager.auth_data:
-            if user.id == uid:
-                FakeAuthManager.auth_data.remove(user)
-        return None
-
-    def create_user(self, name, access=None, secret=None, admin=False):
-        u = auth_manager.User(name, name, access, secret, admin)
-        FakeAuthManager.auth_data.append(u)
-        return u
-
-    def modify_user(self, user_id, access=None, secret=None, admin=None):
-        user = self.get_user(user_id)
-        if user:
-            user.access = access
-            user.secret = secret
-            if admin is not None:
-                user.admin = admin
-
-    def is_admin(self, user_id):
-        user = self.get_user(user_id)
-        return user.admin
-
-    def is_project_member(self, user_id, project):
-        if not isinstance(project, auth_manager.Project):
-            try:
-                project = self.get_project(project)
-            except exc.NotFound:
-                raise webob.exc.HTTPUnauthorized()
-        return ((user_id in project.member_ids) or
-                (user_id == project.project_manager_id))
-
-    def create_project(self, name, manager_user, description=None,
-                       member_users=None):
-        member_ids = ([auto_manager.User.safe_id(m) for m in member_users]
-                      if member_users else [])
-        p = auth_manager.Project(name, name,
-                                 auth_manager.User.safe_id(manager_user),
-                                 description, member_ids)
-        FakeAuthManager.projects[name] = p
-        return p
-
-    def delete_project(self, pid):
-        if pid in FakeAuthManager.projects:
-            del FakeAuthManager.projects[pid]
-
-    def modify_project(self, project, manager_user=None, description=None):
-        p = FakeAuthManager.projects.get(project)
-        p.project_manager_id = auth_manager.User.safe_id(manager_user)
-        p.description = description
-
-    def get_project(self, pid):
-        p = FakeAuthManager.projects.get(pid)
-        if p:
-            return p
-        else:
-            raise exc.NotFound
-
-    def get_projects(self, user_id=None):
-        if not user_id:
-            return FakeAuthManager.projects.values()
-        else:
-            return [p for p in FakeAuthManager.projects.values()
-                    if (user_id in p.member_ids) or
-                       (user_id == p.project_manager_id)]
 
 
 class FakeRateLimiter(object):
@@ -575,9 +456,9 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
         "user_data": "",
         "reservation_id": reservation_id,
         "mac_address": "",
-        "scheduled_at": utils.utcnow(),
-        "launched_at": utils.utcnow(),
-        "terminated_at": utils.utcnow(),
+        "scheduled_at": timeutils.utcnow(),
+        "launched_at": timeutils.utcnow(),
+        "terminated_at": timeutils.utcnow(),
         "availability_zone": "",
         "display_name": display_name or server_name,
         "display_description": "",

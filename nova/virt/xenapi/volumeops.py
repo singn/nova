@@ -19,7 +19,7 @@ Management class for Storage-related functions (attach, detach, etc).
 """
 
 from nova import exception
-from nova import log as logging
+from nova.openstack.common import log as logging
 from nova.virt.xenapi import vm_utils
 from nova.virt.xenapi import volume_utils
 
@@ -33,7 +33,6 @@ class VolumeOps(object):
     """
 
     def __init__(self, session):
-        self.XenAPI = session.get_imported_xenapi()
         self._session = session
 
     def create_volume_for_sm(self, volume, sr_uuid):
@@ -42,14 +41,16 @@ class VolumeOps(object):
         sm_vol_rec = {}
         try:
             sr_ref = self._session.call_xenapi("SR.get_by_uuid", sr_uuid)
-        except self.XenAPI.Failure, exc:
+        except self._session.XenAPI.Failure, exc:
             LOG.exception(exc)
             raise volume_utils.StorageError(_('Unable to get SR using uuid'))
         #Create VDI
-        label = 'vol-' + hex(volume['id'])[:-1]
+        label = 'vol-' + volume['id']
+        desc = 'xensm volume for ' + volume['id']
         # size presented to xenapi is in bytes, while euca api is in GB
         vdi_size = volume['size'] * 1024 * 1024 * 1024
-        vdi_ref = vm_utils.create_vdi(self._session, sr_ref, label,
+        vdi_ref = vm_utils.create_vdi(self._session,
+                                      sr_ref, label, desc,
                                       vdi_size, False)
         vdi_rec = self._session.call_xenapi("VDI.get_record", vdi_ref)
         sm_vol_rec['vdi_uuid'] = vdi_rec['uuid']
@@ -147,7 +148,7 @@ class VolumeOps(object):
         try:
             sr_ref = self.introduce_sr(uuid, label, sr_params)
             LOG.debug(_('Introduced %(label)s as %(sr_ref)s.') % locals())
-        except self.XenAPI.Failure, exc:
+        except self._session.XenAPI.Failure, exc:
             LOG.exception(exc)
             raise volume_utils.StorageError(
                                 _('Unable to introduce Storage Repository'))
@@ -175,7 +176,7 @@ class VolumeOps(object):
         try:
             vbd_ref = vm_utils.create_vbd(self._session, vm_ref, vdi_ref,
                                           dev_number, bootable=False)
-        except self.XenAPI.Failure, exc:
+        except self._session.XenAPI.Failure, exc:
             LOG.exception(exc)
             self.forget_sr(uuid)
             raise Exception(_('Unable to use SR %(sr_ref)s for'
@@ -183,7 +184,7 @@ class VolumeOps(object):
 
         try:
             self._session.call_xenapi("VBD.plug", vbd_ref)
-        except self.XenAPI.Failure, exc:
+        except self._session.XenAPI.Failure, exc:
             LOG.exception(exc)
             self.forget_sr(uuid)
             raise Exception(_('Unable to attach volume to instance %s')

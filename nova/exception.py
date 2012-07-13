@@ -29,8 +29,8 @@ import itertools
 
 import webob.exc
 
-from nova import log as logging
 from nova.openstack.common import excutils
+from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -173,6 +173,10 @@ class DBError(NovaException):
     def __init__(self, inner_exception=None):
         self.inner_exception = inner_exception
         super(DBError, self).__init__(str(inner_exception))
+
+
+class DeprecatedConfig(NovaException):
+    message = _("Fatal call to deprecated config %(msg)")
 
 
 class DecryptionFailure(NovaException):
@@ -807,10 +811,6 @@ class FlavorNotFound(NotFound):
     message = _("Flavor %(flavor_id)s could not be found.")
 
 
-class CellNotFound(NotFound):
-    message = _("Cell %(cell_id)s could not be found.")
-
-
 class SchedulerHostFilterNotFound(NotFound):
     message = _("Scheduler Host Filter %(filter_name)s could not be found.")
 
@@ -1005,6 +1005,10 @@ class VolumeSizeTooLarge(QuotaError):
     message = _("Maximum volume size exceeded")
 
 
+class VolumeLimitExceeded(QuotaError):
+    message = _("Maximum number of volumes allowed (%(allowed)d) exceeded")
+
+
 class FloatingIpLimitExceeded(QuotaError):
     message = _("Maximum number of floating ips exceeded")
 
@@ -1098,6 +1102,14 @@ class InvalidInstanceIDMalformed(Invalid):
 
 class CouldNotFetchImage(NovaException):
     message = _("Could not fetch image %(image_id)s")
+
+
+class TaskAlreadyRunning(NovaException):
+    message = _("Task %(task_name) is already running on host %(host)")
+
+
+class TaskNotRunning(NovaException):
+    message = _("Task %(task_name) is not running on host %(host)")
 
 
 def get_context_from_function_and_args(function, args, kwargs):

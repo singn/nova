@@ -134,6 +134,7 @@ class TestGlanceImageService(test.TestCase):
             'deleted': None,
             'status': None,
             'properties': {'instance_id': '42', 'user_id': 'fake'},
+            'owner': None,
         }
         self.assertDictMatch(image_meta, expected)
 
@@ -165,18 +166,19 @@ class TestGlanceImageService(test.TestCase):
             'deleted': None,
             'status': None,
             'properties': {},
+            'owner': None,
         }
         actual = self.service.show(self.context, image_id)
         self.assertDictMatch(actual, expected)
 
     def test_create(self):
         fixture = self._make_fixture(name='test image')
-        num_images = len(self.service.index(self.context))
+        num_images = len(self.service.detail(self.context))
         image_id = self.service.create(self.context, fixture)['id']
 
         self.assertNotEquals(None, image_id)
         self.assertEquals(num_images + 1,
-                          len(self.service.index(self.context)))
+                          len(self.service.detail(self.context)))
 
     def test_create_and_show_non_existing_image(self):
         fixture = self._make_fixture(name='test image')
@@ -188,108 +190,24 @@ class TestGlanceImageService(test.TestCase):
                           self.context,
                           'bad image id')
 
-    def test_create_and_show_non_existing_image_by_name(self):
-        self.assertRaises(exception.ImageNotFound,
-                          self.service.show_by_name,
-                          self.context,
-                          'bad image id')
-
-    def test_index(self):
-        fixture = self._make_fixture(name='test image')
-        image_id = self.service.create(self.context, fixture)['id']
-        image_metas = self.service.index(self.context)
-        expected = [{'id': image_id, 'name': 'test image'}]
-        self.assertDictListMatch(image_metas, expected)
-
-    def test_index_default_limit(self):
-        fixtures = []
-        ids = []
-        for i in range(10):
-            fixture = self._make_fixture(name='TestImage %d' % (i))
-            fixtures.append(fixture)
-            ids.append(self.service.create(self.context, fixture)['id'])
-
-        image_metas = self.service.index(self.context)
-        i = 0
-        for meta in image_metas:
-            expected = {'id': 'DONTCARE',
-                        'name': 'TestImage %d' % (i)}
-            self.assertDictMatch(meta, expected)
-            i = i + 1
-
-    def test_index_marker(self):
-        fixtures = []
-        ids = []
-        for i in range(10):
-            fixture = self._make_fixture(name='TestImage %d' % (i))
-            fixtures.append(fixture)
-            ids.append(self.service.create(self.context, fixture)['id'])
-
-        image_metas = self.service.index(self.context, marker=ids[1])
-        self.assertEquals(len(image_metas), 8)
-        i = 2
-        for meta in image_metas:
-            expected = {'id': 'DONTCARE',
-                        'name': 'TestImage %d' % (i)}
-            self.assertDictMatch(meta, expected)
-            i = i + 1
-
-    def test_index_limit(self):
-        fixtures = []
-        ids = []
-        for i in range(10):
-            fixture = self._make_fixture(name='TestImage %d' % (i))
-            fixtures.append(fixture)
-            ids.append(self.service.create(self.context, fixture)['id'])
-
-        image_metas = self.service.index(self.context, limit=5)
-        self.assertEquals(len(image_metas), 5)
-
-    def test_index_marker_and_limit(self):
-        fixtures = []
-        ids = []
-        for i in range(10):
-            fixture = self._make_fixture(name='TestImage %d' % (i))
-            fixtures.append(fixture)
-            ids.append(self.service.create(self.context, fixture)['id'])
-
-        image_metas = self.service.index(self.context, marker=ids[3], limit=1)
-        self.assertEquals(len(image_metas), 1)
-        i = 4
-        for meta in image_metas:
-            expected = {'id': ids[i],
-                        'name': 'TestImage %d' % (i)}
-            self.assertDictMatch(meta, expected)
-            i = i + 1
-
-    def test_index_invalid_marker(self):
-        fixtures = []
-        ids = []
-        for i in range(10):
-            fixture = self._make_fixture(name='TestImage %d' % (i))
-            fixtures.append(fixture)
-            ids.append(self.service.create(self.context, fixture)['id'])
-
-        self.assertRaises(exception.Invalid, self.service.index,
-                          self.context, marker='invalidmarker')
-
-    def test_index_private_image(self):
+    def test_detail_private_image(self):
         fixture = self._make_fixture(name='test image')
         fixture['is_public'] = False
         properties = {'owner_id': 'proj1'}
         fixture['properties'] = properties
 
-        image_id = self.service.create(self.context, fixture)['id']
+        self.service.create(self.context, fixture)['id']
 
         proj = self.context.project_id
         self.context.project_id = 'proj1'
 
-        image_metas = self.service.index(self.context)
+        image_metas = self.service.detail(self.context)
 
         self.context.project_id = proj
 
-        expected = [{'id': 'DONTCARE', 'name': 'test image'}]
-        self.assertDictListMatch(image_metas, expected)
+        self.assertEqual(1, len(image_metas))
+        self.assertEqual(image_metas[0]['name'], 'test image')
+        self.assertEqual(image_metas[0]['is_public'], False)
 
     def test_detail_marker(self):
         fixtures = []
@@ -318,7 +236,8 @@ class TestGlanceImageService(test.TestCase):
                 'created_at': self.NOW_DATETIME,
                 'updated_at': self.NOW_DATETIME,
                 'deleted_at': None,
-                'deleted': None
+                'deleted': None,
+                'owner': None,
             }
 
             self.assertDictMatch(meta, expected)
@@ -334,6 +253,18 @@ class TestGlanceImageService(test.TestCase):
 
         image_metas = self.service.detail(self.context, limit=5)
         self.assertEquals(len(image_metas), 5)
+
+    def test_detail_default_limit(self):
+        fixtures = []
+        ids = []
+        for i in range(10):
+            fixture = self._make_fixture(name='TestImage %d' % (i))
+            fixtures.append(fixture)
+            ids.append(self.service.create(self.context, fixture)['id'])
+
+        image_metas = self.service.detail(self.context)
+        for i, meta in enumerate(image_metas):
+            self.assertEqual(meta['name'], 'TestImage %d' % (i))
 
     def test_detail_marker_and_limit(self):
         fixtures = []
@@ -362,7 +293,8 @@ class TestGlanceImageService(test.TestCase):
                 'created_at': self.NOW_DATETIME,
                 'updated_at': self.NOW_DATETIME,
                 'deleted_at': None,
-                'deleted': None
+                'deleted': None,
+                'owner': None,
             }
             self.assertDictMatch(meta, expected)
             i = i + 1
@@ -392,46 +324,20 @@ class TestGlanceImageService(test.TestCase):
         fixture2 = self._make_fixture(name='test image 2')
         fixtures = [fixture1, fixture2]
 
-        num_images = len(self.service.index(self.context))
-        self.assertEquals(0, num_images, str(self.service.index(self.context)))
+        num_images = len(self.service.detail(self.context))
+        self.assertEquals(0, num_images)
 
         ids = []
         for fixture in fixtures:
             new_id = self.service.create(self.context, fixture)['id']
             ids.append(new_id)
 
-        num_images = len(self.service.index(self.context))
-        self.assertEquals(2, num_images, str(self.service.index(self.context)))
+        num_images = len(self.service.detail(self.context))
+        self.assertEquals(2, num_images)
 
         self.service.delete(self.context, ids[0])
 
-        num_images = len(self.service.index(self.context))
-        self.assertEquals(1, num_images)
-
-    def test_delete_not_by_owner(self):
-        # this test is only relevant for deprecated auth mode
-        self.flags(auth_strategy='deprecated')
-
-        fixture = self._make_fixture(name='test image')
-        properties = {'project_id': 'proj1'}
-        fixture['properties'] = properties
-
-        num_images = len(self.service.index(self.context))
-        self.assertEquals(0, num_images)
-
-        image_id = self.service.create(self.context, fixture)['id']
-        num_images = len(self.service.index(self.context))
-        self.assertEquals(1, num_images)
-
-        proj_id = self.context.project_id
-        self.context.project_id = 'proj2'
-
-        self.assertRaises(exception.NotAuthorized, self.service.delete,
-                          self.context, image_id)
-
-        self.context.project_id = proj_id
-
-        num_images = len(self.service.index(self.context))
+        num_images = len(self.service.detail(self.context))
         self.assertEquals(1, num_images)
 
     def test_show_passes_through_to_client(self):
@@ -455,6 +361,7 @@ class TestGlanceImageService(test.TestCase):
             'deleted': None,
             'status': None,
             'properties': {},
+            'owner': None,
         }
         self.assertEqual(image_meta, expected)
 
@@ -501,6 +408,7 @@ class TestGlanceImageService(test.TestCase):
                 'deleted': None,
                 'status': None,
                 'properties': {},
+                'owner': None,
             },
         ]
         self.assertEqual(image_metas, expected)
@@ -519,15 +427,7 @@ class TestGlanceImageService(test.TestCase):
         self.assertEqual(image_meta['created_at'], self.NOW_DATETIME)
         self.assertEqual(image_meta['updated_at'], self.NOW_DATETIME)
 
-    def test_get_makes_datetimes(self):
-        fixture = self._make_datetime_fixture()
-        image_id = self.service.create(self.context, fixture)['id']
-        writer = NullWriter()
-        image_meta = self.service.get(self.context, image_id, writer)
-        self.assertEqual(image_meta['created_at'], self.NOW_DATETIME)
-        self.assertEqual(image_meta['updated_at'], self.NOW_DATETIME)
-
-    def test_get_with_retries(self):
+    def test_download_with_retries(self):
         tries = [0]
 
         class GlanceBusyException(Exception):
@@ -549,12 +449,12 @@ class TestGlanceImageService(test.TestCase):
 
         # When retries are disabled, we should get an exception
         self.flags(glance_num_retries=0)
-        self.assertRaises(GlanceBusyException, service.get, self.context,
+        self.assertRaises(GlanceBusyException, service.download, self.context,
                           image_id, writer)
 
         # Now lets enable retries. No exception should happen now.
         self.flags(glance_num_retries=1)
-        service.get(self.context, image_id, writer)
+        service.download(self.context, image_id, writer)
 
     def test_client_raises_forbidden(self):
         class MyGlanceStubClient(glance_stubs.StubGlanceClient):
@@ -566,19 +466,19 @@ class TestGlanceImageService(test.TestCase):
         service = glance.GlanceImageService(client=client)
         image_id = 1  # doesn't matter
         writer = NullWriter()
-        self.assertRaises(exception.ImageNotAuthorized, service.get,
+        self.assertRaises(exception.ImageNotAuthorized, service.download,
                           self.context, image_id, writer)
 
     def test_glance_client_image_id(self):
         fixture = self._make_fixture(name='test image')
         image_id = self.service.create(self.context, fixture)['id']
-        client, same_id = glance.get_glance_client(self.context, image_id)
+        client, same_id = glance._get_glance_client(self.context, image_id)
         self.assertEquals(same_id, image_id)
 
     def test_glance_client_image_ref(self):
         fixture = self._make_fixture(name='test image')
         image_id = self.service.create(self.context, fixture)['id']
         image_url = 'http://something-less-likely/%s' % image_id
-        client, same_id = glance.get_glance_client(self.context, image_url)
+        client, same_id = glance._get_glance_client(self.context, image_url)
         self.assertEquals(same_id, image_id)
         self.assertEquals(client.host, 'something-less-likely')

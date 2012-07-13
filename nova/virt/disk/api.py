@@ -33,9 +33,9 @@ import tempfile
 
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.disk import guestfs
 from nova.virt.disk import loop
@@ -108,6 +108,11 @@ def get_image_virtual_size(image):
     return int(m.group(2))
 
 
+def resize2fs(image, check_exit_code=False):
+    utils.execute('e2fsck', '-fp', image, check_exit_code=check_exit_code)
+    utils.execute('resize2fs', image, check_exit_code=check_exit_code)
+
+
 def extend(image, size):
     """Increase image to size"""
     # NOTE(MotoKen): check image virtual size before resize
@@ -116,8 +121,7 @@ def extend(image, size):
         return
     utils.execute('qemu-img', 'resize', image, size)
     # NOTE(vish): attempts to resize filesystem
-    utils.execute('e2fsck', '-fp', image, check_exit_code=False)
-    utils.execute('resize2fs', image, check_exit_code=False)
+    resize2fs(image)
 
 
 def bind(src, target, instance_name):
@@ -225,7 +229,7 @@ class _DiskImage(object):
 
 def inject_data(image,
                 key=None, net=None, metadata=None, admin_password=None,
-                partition=None, use_cow=False):
+                files=None, partition=None, use_cow=False):
     """Injects a ssh key and optionally net data into a disk image.
 
     it will mount the image as a fully partitioned disk and attempt to inject
@@ -238,21 +242,7 @@ def inject_data(image,
     if img.mount():
         try:
             inject_data_into_fs(img.mount_dir,
-                                key, net, metadata, admin_password,
-                                utils.execute)
-        finally:
-            img.umount()
-    else:
-        raise exception.NovaException(img.errors)
-
-
-def inject_files(image, files, partition=None, use_cow=False):
-    """Injects arbitrary files into a disk image"""
-    img = _DiskImage(image=image, partition=partition, use_cow=use_cow)
-    if img.mount():
-        try:
-            for (path, contents) in files:
-                _inject_file_into_fs(img.mount_dir, path, contents)
+                                key, net, metadata, admin_password, files)
         finally:
             img.umount()
     else:
@@ -267,14 +257,15 @@ def setup_container(image, container_dir=None, use_cow=False):
 
     LXC does not support qcow2 images yet.
     """
-    try:
-        img = _DiskImage(image=image, use_cow=use_cow, mount_dir=container_dir)
-        if img.mount():
-            return img
-        else:
-            raise exception.NovaException(img.errors)
-    except Exception, exn:
-        LOG.exception(_('Failed to mount filesystem: %s'), exn)
+    img = _DiskImage(image=image, use_cow=use_cow, mount_dir=container_dir)
+    if img.mount():
+        return img
+    else:
+        LOG.error(_("Failed to mount container filesystem '%(image)s' "
+                    "on '%(target)s': %(errors)s") %
+                  {"image": img, "target": container_dir,
+                   "errors": img.errors})
+        raise exception.NovaException(img.errors)
 
 
 def destroy_container(img):
@@ -289,76 +280,101 @@ def destroy_container(img):
         if img:
             img.umount()
     except Exception, exn:
-        LOG.exception(_('Failed to remove container: %s'), exn)
+        LOG.exception(_('Failed to unmount container filesystem: %s'), exn)
 
 
-def inject_data_into_fs(fs, key, net, metadata, admin_password, execute):
+def inject_data_into_fs(fs, key, net, metadata, admin_password, files):
     """Injects data into a filesystem already mounted by the caller.
     Virt connections can call this directly if they mount their fs
     in a different way to inject_data
     """
     if key:
-        _inject_key_into_fs(key, fs, execute=execute)
+        _inject_key_into_fs(key, fs)
     if net:
-        _inject_net_into_fs(net, fs, execute=execute)
+        _inject_net_into_fs(net, fs)
     if metadata:
-        _inject_metadata_into_fs(metadata, fs, execute=execute)
+        _inject_metadata_into_fs(metadata, fs)
     if admin_password:
-        _inject_admin_password_into_fs(admin_password, fs, execute=execute)
+        _inject_admin_password_into_fs(admin_password, fs)
+    if files:
+        for (path, contents) in files:
+            _inject_file_into_fs(fs, path, contents)
 
 
-def _inject_file_into_fs(fs, path, contents):
-    absolute_path = os.path.join(fs, path.lstrip('/'))
+def _join_and_check_path_within_fs(fs, *args):
+    '''os.path.join() with safety check for injected file paths.
+
+    Join the supplied path components and make sure that the
+    resulting path we are injecting into is within the
+    mounted guest fs.  Trying to be clever and specifying a
+    path with '..' in it will hit this safeguard.
+    '''
+    absolute_path = os.path.realpath(os.path.join(fs, *args))
+    if not absolute_path.startswith(os.path.realpath(fs) + '/'):
+        raise exception.Invalid(_('injected file path not valid'))
+    return absolute_path
+
+
+def _inject_file_into_fs(fs, path, contents, append=False):
+    absolute_path = _join_and_check_path_within_fs(fs, path.lstrip('/'))
+
     parent_dir = os.path.dirname(absolute_path)
     utils.execute('mkdir', '-p', parent_dir, run_as_root=True)
-    utils.execute('tee', absolute_path, process_input=contents,
-          run_as_root=True)
+
+    args = []
+    if append:
+        args.append('-a')
+    args.append(absolute_path)
+
+    kwargs = dict(process_input=contents, run_as_root=True)
+
+    utils.execute('tee', *args, **kwargs)
 
 
-def _inject_metadata_into_fs(metadata, fs, execute=None):
-    metadata_path = os.path.join(fs, "meta.js")
+def _inject_metadata_into_fs(metadata, fs):
     metadata = dict([(m.key, m.value) for m in metadata])
-
-    utils.execute('tee', metadata_path,
-                  process_input=jsonutils.dumps(metadata), run_as_root=True)
+    _inject_file_into_fs(fs, 'meta.js', jsonutils.dumps(metadata))
 
 
-def _inject_key_into_fs(key, fs, execute=None):
+def _inject_key_into_fs(key, fs):
     """Add the given public ssh key to root's authorized_keys.
 
     key is an ssh key string.
     fs is the path to the base of the filesystem into which to inject the key.
     """
-    sshdir = os.path.join(fs, 'root', '.ssh')
+    sshdir = _join_and_check_path_within_fs(fs, 'root', '.ssh')
     utils.execute('mkdir', '-p', sshdir, run_as_root=True)
     utils.execute('chown', 'root', sshdir, run_as_root=True)
     utils.execute('chmod', '700', sshdir, run_as_root=True)
-    keyfile = os.path.join(sshdir, 'authorized_keys')
-    key_data = [
+
+    keyfile = os.path.join('root', '.ssh', 'authorized_keys')
+
+    key_data = ''.join([
         '\n',
         '# The following ssh key was injected by Nova',
         '\n',
         key.strip(),
         '\n',
-    ]
-    utils.execute('tee', '-a', keyfile,
-                  process_input=''.join(key_data), run_as_root=True)
+    ])
+
+    _inject_file_into_fs(fs, keyfile, key_data, append=True)
 
 
-def _inject_net_into_fs(net, fs, execute=None):
+def _inject_net_into_fs(net, fs):
     """Inject /etc/network/interfaces into the filesystem rooted at fs.
 
     net is the contents of /etc/network/interfaces.
     """
-    netdir = os.path.join(os.path.join(fs, 'etc'), 'network')
+    netdir = _join_and_check_path_within_fs(fs, 'etc', 'network')
     utils.execute('mkdir', '-p', netdir, run_as_root=True)
     utils.execute('chown', 'root:root', netdir, run_as_root=True)
     utils.execute('chmod', 755, netdir, run_as_root=True)
-    netfile = os.path.join(netdir, 'interfaces')
-    utils.execute('tee', netfile, process_input=net, run_as_root=True)
+
+    netfile = os.path.join('etc', 'network', 'interfaces')
+    _inject_file_into_fs(fs, netfile, net)
 
 
-def _inject_admin_password_into_fs(admin_passwd, fs, execute=None):
+def _inject_admin_password_into_fs(admin_passwd, fs):
     """Set the root password to admin_passwd
 
     admin_password is a root password
@@ -380,16 +396,15 @@ def _inject_admin_password_into_fs(admin_passwd, fs, execute=None):
     fd, tmp_shadow = tempfile.mkstemp()
     os.close(fd)
 
-    utils.execute('cp', os.path.join(fs, 'etc', 'passwd'), tmp_passwd,
-                  run_as_root=True)
-    utils.execute('cp', os.path.join(fs, 'etc', 'shadow'), tmp_shadow,
-                  run_as_root=True)
+    passwd_path = _join_and_check_path_within_fs(fs, 'etc', 'passwd')
+    shadow_path = _join_and_check_path_within_fs(fs, 'etc', 'shadow')
+
+    utils.execute('cp', passwd_path, tmp_passwd, run_as_root=True)
+    utils.execute('cp', shadow_path, tmp_shadow, run_as_root=True)
     _set_passwd(admin_user, admin_passwd, tmp_passwd, tmp_shadow)
-    utils.execute('cp', tmp_passwd, os.path.join(fs, 'etc', 'passwd'),
-                  run_as_root=True)
+    utils.execute('cp', tmp_passwd, passwd_path, run_as_root=True)
     os.unlink(tmp_passwd)
-    utils.execute('cp', tmp_shadow, os.path.join(fs, 'etc', 'shadow'),
-                  run_as_root=True)
+    utils.execute('cp', tmp_shadow, shadow_path, run_as_root=True)
     os.unlink(tmp_shadow)
 
 

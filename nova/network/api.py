@@ -17,15 +17,59 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import functools
+import inspect
+
 from nova.db import base
 from nova import flags
-from nova import log as logging
 from nova.network import model as network_model
-from nova import rpc
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
 
 
 FLAGS = flags.FLAGS
 LOG = logging.getLogger(__name__)
+
+
+def refresh_cache(f):
+    """
+    Decorator to update the instance_info_cache
+
+    Requires context and instance as function args
+    """
+    argspec = inspect.getargspec(f)
+
+    @functools.wraps(f)
+    def wrapper(self, context, *args, **kwargs):
+        res = f(self, context, *args, **kwargs)
+
+        try:
+            # get the instance from arguments (or raise ValueError)
+            instance = kwargs.get('instance')
+            if not instance:
+                instance = args[argspec.args.index('instance') - 2]
+        except ValueError:
+            msg = _('instance is a required argument to use @refresh_cache')
+            raise Exception(msg)
+
+        try:
+            # get nw_info from return if possible, otherwise call for it
+            nw_info = res
+            if not isinstance(nw_info, network_model.NetworkInfo):
+                nw_info = self._get_instance_nw_info(context, instance)
+
+            # update cache
+            cache = {'network_info': nw_info.json()}
+            self.db.instance_info_cache_update(context, instance['uuid'],
+                                               cache)
+        except Exception:
+            LOG.exception('Failed storing info cache', instance=instance)
+            LOG.debug(_('args: %s') % args)
+            LOG.debug(_('kwargs: %s') % kwargs)
+
+        # return the original function's return value
+        return res
+    return wrapper
 
 
 class API(base.Base):
@@ -95,6 +139,13 @@ class API(base.Base):
                         {'method': 'get_floating_ips_by_fixed_address',
                          'args': {'fixed_address': fixed_address}})
 
+    def get_instance_id_by_floating_address(self, context, address):
+        # NOTE(tr3buchet): i hate this
+        return rpc.call(context,
+                        FLAGS.network_topic,
+                        {'method': 'get_instance_id_by_floating_address',
+                         'args': {'address': address}})
+
     def get_vifs_by_instance(self, context, instance):
         # NOTE(vish): When the db calls are converted to store network
         #             data by instance_uuid, this should pass uuid instead.
@@ -124,14 +175,16 @@ class API(base.Base):
     def release_floating_ip(self, context, address,
                             affect_auto_assigned=False):
         """Removes floating ip with address from a project. (deallocates)"""
-        rpc.cast(context,
+        rpc.call(context,
                  FLAGS.network_topic,
                  {'method': 'deallocate_floating_ip',
                   'args': {'address': address,
                            'affect_auto_assigned': affect_auto_assigned}})
 
-    def associate_floating_ip(self, context, floating_address, fixed_address,
-                                                 affect_auto_assigned=False):
+    @refresh_cache
+    def associate_floating_ip(self, context, instance,
+                              floating_address, fixed_address,
+                              affect_auto_assigned=False):
         """Associates a floating ip with a fixed ip.
 
         ensures floating ip is allocated to the project in context
@@ -143,14 +196,16 @@ class API(base.Base):
                            'fixed_address': fixed_address,
                            'affect_auto_assigned': affect_auto_assigned}})
 
-    def disassociate_floating_ip(self, context, address,
+    @refresh_cache
+    def disassociate_floating_ip(self, context, instance, address,
                                  affect_auto_assigned=False):
         """Disassociates a floating ip from fixed ip it is associated with."""
-        rpc.cast(context,
+        rpc.call(context,
                  FLAGS.network_topic,
                  {'method': 'disassociate_floating_ip',
                   'args': {'address': address}})
 
+    @refresh_cache
     def allocate_for_instance(self, context, instance, **kwargs):
         """Allocates all network structures for an instance.
 
@@ -175,7 +230,7 @@ class API(base.Base):
         args['instance_id'] = instance['id']
         args['project_id'] = instance['project_id']
         args['host'] = instance['host']
-        rpc.cast(context, FLAGS.network_topic,
+        rpc.call(context, FLAGS.network_topic,
                  {'method': 'deallocate_for_instance',
                   'args': args})
 
@@ -184,7 +239,7 @@ class API(base.Base):
         args = {'instance_id': instance['id'],
                 'host': instance['host'],
                 'network_id': network_id}
-        rpc.cast(context, FLAGS.network_topic,
+        rpc.call(context, FLAGS.network_topic,
                  {'method': 'add_fixed_ip_to_instance',
                   'args': args})
 
@@ -194,17 +249,22 @@ class API(base.Base):
         args = {'instance_id': instance['id'],
                 'host': instance['host'],
                 'address': address}
-        rpc.cast(context, FLAGS.network_topic,
+        rpc.call(context, FLAGS.network_topic,
                  {'method': 'remove_fixed_ip_from_instance',
                   'args': args})
 
     def add_network_to_project(self, context, project_id):
         """Force adds another network to a project."""
-        rpc.cast(context, FLAGS.network_topic,
+        rpc.call(context, FLAGS.network_topic,
                  {'method': 'add_network_to_project',
                   'args': {'project_id': project_id}})
 
+    @refresh_cache
     def get_instance_nw_info(self, context, instance):
+        """Returns all network info related to an instance."""
+        return self._get_instance_nw_info(context, instance)
+
+    def _get_instance_nw_info(self, context, instance):
         """Returns all network info related to an instance."""
         args = {'instance_id': instance['id'],
                 'instance_uuid': instance['uuid'],
@@ -214,6 +274,7 @@ class API(base.Base):
         nw_info = rpc.call(context, FLAGS.network_topic,
                            {'method': 'get_instance_nw_info',
                             'args': args})
+
         return network_model.NetworkInfo.hydrate(nw_info)
 
     def validate_networks(self, context, requested_networks):

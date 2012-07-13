@@ -33,9 +33,9 @@ from nova.api.ec2 import ec2utils
 import nova.cert.rpcapi
 from nova import exception
 from nova import flags
-from nova import image
-from nova import log as logging
+from nova.image import glance
 from nova.openstack.common import cfg
+from nova.openstack.common import log as logging
 from nova import utils
 
 
@@ -69,7 +69,7 @@ class S3ImageService(object):
 
     def __init__(self, service=None, *args, **kwargs):
         self.cert_rpcapi = nova.cert.rpcapi.CertAPI()
-        self.service = service or image.get_default_image_service()
+        self.service = service or glance.get_default_image_service()
         self.service.__init__(*args, **kwargs)
 
     def _translate_uuids_to_ids(self, context, images):
@@ -136,25 +136,16 @@ class S3ImageService(object):
         image = self.service.update(context, image_uuid, metadata, data)
         return self._translate_uuid_to_id(context, image)
 
-    def index(self, context):
+    def detail(self, context, **kwargs):
         #NOTE(bcwaldon): sort asc to make sure we assign lower ids
         # to older images
-        images = self.service.index(context, sort_dir='asc')
-        return self._translate_uuids_to_ids(context, images)
-
-    def detail(self, context):
-        #NOTE(bcwaldon): sort asc to make sure we assign lower ids
-        # to older images
-        images = self.service.detail(context, sort_dir='asc')
+        kwargs.setdefault('sort_dir', 'asc')
+        images = self.service.detail(context, **kwargs)
         return self._translate_uuids_to_ids(context, images)
 
     def show(self, context, image_id):
         image_uuid = ec2utils.id_to_glance_id(context, image_id)
         image = self.service.show(context, image_uuid)
-        return self._translate_uuid_to_id(context, image)
-
-    def show_by_name(self, context, name):
-        image = self.service.show_by_name(context, name)
         return self._translate_uuid_to_id(context, image)
 
     @staticmethod

@@ -17,6 +17,7 @@
 import os
 import StringIO
 
+
 files = {}
 disk_sizes = {}
 disk_backing_files = {}
@@ -47,6 +48,22 @@ def copy_image(src, dest):
 
 
 def mkfs(fs, path):
+    pass
+
+
+def resize2fs(path):
+    pass
+
+
+def create_lvm_image(vg, lv, size, sparse=False):
+    pass
+
+
+def volume_group_free_space(vg):
+    pass
+
+
+def remove_logical_volumes(*paths):
     pass
 
 
@@ -99,11 +116,6 @@ def load_file(path):
 
 def file_delete(path):
     return True
-
-
-def get_open_port(start_port, end_port):
-    # Return the port in the middle
-    return int((start_port + end_port) / 2)
 
 
 def get_fs_info(path):

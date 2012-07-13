@@ -16,11 +16,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from sqlalchemy import select, Column, ForeignKey, Integer
-from sqlalchemy import MetaData, String, Table
 from migrate import ForeignKeyConstraint
+from sqlalchemy import MetaData, String, Table
+from sqlalchemy import select, Column, ForeignKey, Integer
 
-from nova import log as logging
+from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)

@@ -19,13 +19,13 @@ Client side of the console RPC API.
 """
 
 from nova import flags
-import nova.rpc.proxy
+import nova.openstack.common.rpc.proxy
 
 
 FLAGS = flags.FLAGS
 
 
-class ConsoleAPI(nova.rpc.proxy.RpcProxy):
+class ConsoleAPI(nova.openstack.common.rpc.proxy.RpcProxy):
     '''Client side of the console rpc API.
 
     API version history:
@@ -33,12 +33,13 @@ class ConsoleAPI(nova.rpc.proxy.RpcProxy):
         1.0 - Initial version.
     '''
 
-    RPC_API_VERSION = '1.0'
+    BASE_RPC_API_VERSION = '1.0'
 
     def __init__(self, topic=None):
         topic = topic if topic else FLAGS.console_topic
-        super(ConsoleAPI, self).__init__(topic=topic,
-                                         default_version=self.RPC_API_VERSION)
+        super(ConsoleAPI, self).__init__(
+                topic=topic,
+                default_version=self.BASE_RPC_API_VERSION)
 
     def add_console(self, ctxt, instance_id):
         self.cast(ctxt, self.make_msg('add_console', instance_id=instance_id))

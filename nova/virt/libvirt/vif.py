@@ -21,9 +21,9 @@
 
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.network import linux_net
 from nova.openstack.common import cfg
+from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt import netutils
 from nova.virt import vif
@@ -43,7 +43,7 @@ libvirt_vif_opts = [
 
 FLAGS = flags.FLAGS
 FLAGS.register_opts(libvirt_vif_opts)
-flags.DECLARE('libvirt_type', 'nova.virt.libvirt.connection')
+flags.DECLARE('libvirt_type', 'nova.virt.libvirt.driver')
 
 
 class LibvirtBridgeDriver(vif.VIFDriver):

@@ -23,11 +23,12 @@ import nova.context
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log
 from nova import network
 from nova.network import model as network_model
-from nova.notifier import api as notifier_api
 from nova.openstack.common import cfg
+from nova.openstack.common import log
+from nova.openstack.common.notifier import api as notifier_api
+from nova.openstack.common import timeutils
 from nova import utils
 
 LOG = log.getLogger(__name__)
@@ -85,7 +86,7 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
 
 def _send_instance_update_notification(context, instance, old_vm_state,
         old_task_state, new_vm_state, new_task_state, service=None, host=None):
-    """Send 'compute.instance.exists' notification to inform observers
+    """Send 'compute.instance.update' notification to inform observers
     about instance state changes"""
 
     payload = usage_from_instance(context, instance, None, None)
@@ -107,16 +108,6 @@ def _send_instance_update_notification(context, instance, old_vm_state,
     # add bw usage info:
     bw = bandwidth_usage(instance, audit_start)
     payload["bandwidth"] = bw
-
-    try:
-        system_metadata = db.instance_system_metadata_get(
-                context, instance.uuid)
-    except exception.NotFound:
-        system_metadata = {}
-
-    # add image metadata
-    image_meta_props = image_meta(system_metadata)
-    payload["image_meta"] = image_meta_props
 
     # if the service name (e.g. api/scheduler/compute) is not provided, default
     # to "compute"
@@ -140,7 +131,7 @@ def audit_period_bounds(current_period=False):
     begin, end = utils.last_completed_audit_period()
     if current_period:
         audit_start = end
-        audit_end = utils.utcnow()
+        audit_end = timeutils.utcnow()
     else:
         audit_start = begin
         audit_end = end
@@ -157,7 +148,7 @@ def bandwidth_usage(instance_ref, audit_start,
     admin_context = nova.context.get_admin_context(read_deleted='yes')
 
     if (instance_ref.get('info_cache') and
-        instance_ref['info_cache'].get('network_info')):
+        instance_ref['info_cache'].get('network_info') is not None):
 
         cached_info = instance_ref['info_cache']['network_info']
         nw_info = network_model.NetworkInfo.hydrate(cached_info)
@@ -221,27 +212,73 @@ def usage_from_instance(context, instance_ref, network_info,
 
     instance_type_name = instance_ref.get('instance_type', {}).get('name', '')
 
+    if system_metadata is None:
+        try:
+            system_metadata = db.instance_system_metadata_get(
+                    context, instance_ref['uuid'])
+
+        except exception.NotFound:
+            system_metadata = {}
+
     usage_info = dict(
+        # Owner properties
         tenant_id=instance_ref['project_id'],
         user_id=instance_ref['user_id'],
+
+        # Identity properties
         instance_id=instance_ref['uuid'],
+        display_name=instance_ref['display_name'],
+        reservation_id=instance_ref['reservation_id'],
+
+        # Type properties
         instance_type=instance_type_name,
         instance_type_id=instance_ref['instance_type_id'],
+        architecture=instance_ref['architecture'],
+
+        # Capacity properties
         memory_mb=instance_ref['memory_mb'],
         disk_gb=instance_ref['root_gb'] + instance_ref['ephemeral_gb'],
-        display_name=instance_ref['display_name'],
+        vcpus=instance_ref['vcpus'],
+        # Note(dhellmann): This makes the disk_gb value redundant, but
+        # we are keeping it for backwards-compatibility with existing
+        # users of notifications.
+        root_gb=instance_ref['root_gb'],
+        ephemeral_gb=instance_ref['ephemeral_gb'],
+
+        # Location properties
+        host=instance_ref['host'],
+        availability_zone=instance_ref['availability_zone'],
+
+        # Date properties
         created_at=str(instance_ref['created_at']),
         # Nova's deleted vs terminated instance terminology is confusing,
         # this should be when the instance was deleted (i.e. terminated_at),
         # not when the db record was deleted. (mdragon)
         deleted_at=null_safe_str(instance_ref.get('terminated_at')),
         launched_at=null_safe_str(instance_ref.get('launched_at')),
+
+        # Image properties
         image_ref_url=image_ref_url,
+        os_type=instance_ref['os_type'],
+        kernel_id=instance_ref['kernel_id'],
+        ramdisk_id=instance_ref['ramdisk_id'],
+
+        # Status properties
         state=instance_ref['vm_state'],
-        state_description=null_safe_str(instance_ref.get('task_state')))
+        state_description=null_safe_str(instance_ref.get('task_state')),
+        )
 
     if network_info is not None:
-        usage_info['fixed_ips'] = network_info.fixed_ips()
+        fixed_ips = []
+        for vif in network_info:
+            for ip in vif.fixed_ips():
+                ip["label"] = vif["network"]["label"]
+                fixed_ips.append(ip)
+        usage_info['fixed_ips'] = fixed_ips
+
+    # add image metadata
+    image_meta_props = image_meta(system_metadata)
+    usage_info["image_meta"] = image_meta_props
 
     usage_info.update(kw)
     return usage_info

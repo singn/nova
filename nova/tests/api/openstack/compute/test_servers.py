@@ -35,12 +35,12 @@ from nova.compute import vm_states
 import nova.db
 from nova.db.sqlalchemy import models
 from nova import flags
-import nova.image.fake
 from nova.openstack.common import jsonutils
-import nova.rpc
+import nova.openstack.common.rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_network
+import nova.tests.image.fake
 from nova import utils
 
 
@@ -52,6 +52,8 @@ XPATH_NS = {
     'atom': 'http://www.w3.org/2005/Atom',
     'ns': 'http://docs.openstack.org/compute/api/v1.1'
 }
+
+INSTANCE_IDS = {FAKE_UUID: 1}
 
 
 def fake_gen_uuid():
@@ -71,8 +73,9 @@ def return_security_group(context, instance_id, security_group_id):
     pass
 
 
-def instance_update(context, instance_id, values):
-    inst = fakes.stub_instance(instance_id, name=values.get('display_name'))
+def instance_update(context, instance_uuid, values):
+    inst = fakes.stub_instance(INSTANCE_IDS.get(instance_uuid),
+                               name=values.get('display_name'))
     return (inst, inst)
 
 
@@ -96,7 +99,7 @@ class ServersControllerTest(test.TestCase):
         self.flags(verbose=True, use_ipv6=False)
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_key_pair_funcs(self.stubs)
-        fakes.stub_out_image_service(self.stubs)
+        nova.tests.image.fake.stub_out_image_service(self.stubs)
         return_server = fakes.fake_instance_get()
         return_servers = fakes.fake_instance_get_all_by_filters()
         self.stubs.Set(nova.db, 'instance_get_all_by_filters',
@@ -115,6 +118,12 @@ class ServersControllerTest(test.TestCase):
 
         fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs,
                                                           spectacular=True)
+
+    def test_requested_networks_prefix(self):
+        uuid = 'br-00000000-0000-0000-0000-000000000000'
+        requested_networks = [{'uuid': uuid}]
+        res = self.controller._get_requested_networks(requested_networks)
+        self.assertTrue((uuid, None) in res)
 
     def test_get_server_by_uuid(self):
         req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
@@ -928,6 +937,32 @@ class ServersControllerTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
                             req, FAKE_UUID, body)
 
+    def test_update_server_access_ipv4_none(self):
+        self.stubs.Set(nova.db, 'instance_get',
+                fakes.fake_instance_get(access_ipv4='0.0.0.0'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = 'application/json'
+        body = {'server': {'accessIPv4': None}}
+        req.body = jsonutils.dumps(body)
+        res_dict = self.controller.update(req, FAKE_UUID, body)
+
+        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
+        self.assertEqual(res_dict['server']['accessIPv4'], '')
+
+    def test_update_server_access_ipv4_blank(self):
+        self.stubs.Set(nova.db, 'instance_get',
+                fakes.fake_instance_get(access_ipv4='0.0.0.0'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = 'application/json'
+        body = {'server': {'accessIPv4': ''}}
+        req.body = jsonutils.dumps(body)
+        res_dict = self.controller.update(req, FAKE_UUID, body)
+
+        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
+        self.assertEqual(res_dict['server']['accessIPv4'], '')
+
     def test_update_server_access_ipv6(self):
         self.stubs.Set(nova.db, 'instance_get',
                 fakes.fake_instance_get(access_ipv6='beef::0123'))
@@ -951,6 +986,32 @@ class ServersControllerTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
                             req, FAKE_UUID, body)
+
+    def test_update_server_access_ipv6_none(self):
+        self.stubs.Set(nova.db, 'instance_get',
+                fakes.fake_instance_get(access_ipv6='beef::0123'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = 'application/json'
+        body = {'server': {'accessIPv6': None}}
+        req.body = jsonutils.dumps(body)
+        res_dict = self.controller.update(req, FAKE_UUID, body)
+
+        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
+        self.assertEqual(res_dict['server']['accessIPv6'], '')
+
+    def test_update_server_access_ipv6_blank(self):
+        self.stubs.Set(nova.db, 'instance_get',
+                fakes.fake_instance_get(access_ipv6='beef::0123'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = 'application/json'
+        body = {'server': {'accessIPv6': ''}}
+        req.body = jsonutils.dumps(body)
+        res_dict = self.controller.update(req, FAKE_UUID, body)
+
+        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
+        self.assertEqual(res_dict['server']['accessIPv6'], '')
 
     def test_update_server_adminPass_ignored(self):
         inst_dict = dict(name='server_test', adminPass='bacon')
@@ -1328,16 +1389,17 @@ class ServersControllerTest(test.TestCase):
         self.server_delete_called = False
 
         self.stubs.Set(nova.db, 'instance_get_by_uuid',
-                fakes.fake_instance_get(vm_state=vm_states.RESIZING))
+                fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
+                                        task_state=task_states.RESIZE_PREP))
 
-        def instance_destroy_mock(context, id):
+        def instance_destroy_mock(*args, **kwargs):
             self.server_delete_called = True
         self.stubs.Set(nova.db, 'instance_destroy', instance_destroy_mock)
 
-        self.assertRaises(webob.exc.HTTPConflict,
-                          self.controller.delete,
-                          req,
-                          FAKE_UUID)
+        self.controller.delete(req, FAKE_UUID)
+        # Delete shoud be allowed in any case, even during resizing,
+        # because it may get stuck.
+        self.assertEqual(self.server_delete_called, True)
 
 
 class ServerStatusTest(test.TestCase):
@@ -1371,7 +1433,8 @@ class ServerStatusTest(test.TestCase):
         self.assertEqual(response['server']['status'], 'HARD_REBOOT')
 
     def test_rebuild(self):
-        response = self._get_with_state(vm_states.REBUILDING)
+        response = self._get_with_state(vm_states.ACTIVE,
+                                        task_states.REBUILDING)
         self.assertEqual(response['server']['status'], 'REBUILD')
 
     def test_rebuild_error(self):
@@ -1379,16 +1442,16 @@ class ServerStatusTest(test.TestCase):
         self.assertEqual(response['server']['status'], 'ERROR')
 
     def test_resize(self):
-        response = self._get_with_state(vm_states.RESIZING)
+        response = self._get_with_state(vm_states.ACTIVE,
+                                        task_states.RESIZE_PREP)
         self.assertEqual(response['server']['status'], 'RESIZE')
 
     def test_verify_resize(self):
-        response = self._get_with_state(vm_states.ACTIVE,
-                                        task_states.RESIZE_VERIFY)
+        response = self._get_with_state(vm_states.RESIZED, None)
         self.assertEqual(response['server']['status'], 'VERIFY_RESIZE')
 
     def test_revert_resize(self):
-        response = self._get_with_state(vm_states.RESIZING,
+        response = self._get_with_state(vm_states.RESIZED,
                                         task_states.RESIZE_REVERTING)
         self.assertEqual(response['server']['status'], 'REVERT_RESIZE')
 
@@ -1399,7 +1462,7 @@ class ServerStatusTest(test.TestCase):
 
     def test_stopped(self):
         response = self._get_with_state(vm_states.STOPPED)
-        self.assertEqual(response['server']['status'], 'STOPPED')
+        self.assertEqual(response['server']['status'], 'SHUTOFF')
 
 
 class ServersControllerCreateTest(test.TestCase):
@@ -1411,7 +1474,8 @@ class ServersControllerCreateTest(test.TestCase):
         self.flags(verbose=True,
                    enable_instance_password=True)
         self.instance_cache_num = 0
-        self.instance_cache = {}
+        self.instance_cache_by_id = {}
+        self.instance_cache_by_uuid = {}
 
         self.controller = servers.Controller()
 
@@ -1439,14 +1503,16 @@ class ServersControllerCreateTest(test.TestCase):
                 "task_state": "",
                 "vm_state": "",
             }
-            self.instance_cache[instance['id']] = instance
+
+            self.instance_cache_by_id[instance['id']] = instance
+            self.instance_cache_by_uuid[instance['uuid']] = instance
             return instance
 
         def instance_get(context, instance_id):
             """Stub for compute/api create() pulling in instance after
             scheduling
             """
-            return self.instance_cache[instance_id]
+            return self.instance_cache_by_id[instance_id]
 
         def rpc_call_wrapper(context, topic, msg, timeout=None):
             """Stub out the scheduler creating the instance entry"""
@@ -1460,8 +1526,8 @@ class ServersControllerCreateTest(test.TestCase):
                         request_spec['instance_properties']))
                 return instances
 
-        def server_update(context, instance_id, params):
-            inst = self.instance_cache[instance_id]
+        def server_update(context, instance_uuid, params):
+            inst = self.instance_cache_by_uuid[instance_uuid]
             inst.update(params)
             return (inst, inst)
 
@@ -1476,7 +1542,7 @@ class ServersControllerCreateTest(test.TestCase):
 
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_key_pair_funcs(self.stubs)
-        fakes.stub_out_image_service(self.stubs)
+        nova.tests.image.fake.stub_out_image_service(self.stubs)
         fakes.stub_out_nw_api(self.stubs)
         self.stubs.Set(utils, 'gen_uuid', fake_gen_uuid)
         self.stubs.Set(nova.db, 'instance_add_security_group',
@@ -1487,11 +1553,12 @@ class ServersControllerCreateTest(test.TestCase):
         self.stubs.Set(nova.db, 'instance_system_metadata_update',
                 fake_method)
         self.stubs.Set(nova.db, 'instance_get', instance_get)
-        self.stubs.Set(nova.rpc, 'cast', fake_method)
-        self.stubs.Set(nova.rpc, 'call', rpc_call_wrapper)
+        self.stubs.Set(nova.openstack.common.rpc, 'cast', fake_method)
+        self.stubs.Set(nova.openstack.common.rpc, 'call', rpc_call_wrapper)
         self.stubs.Set(nova.db, 'instance_update_and_get_original',
                 server_update)
-        self.stubs.Set(nova.rpc, 'queue_get_for', queue_get_for)
+        self.stubs.Set(nova.openstack.common.rpc, 'queue_get_for',
+                queue_get_for)
         self.stubs.Set(nova.network.manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
 
@@ -2839,6 +2906,19 @@ class ServersViewBuilderTest(test.TestCase):
         self.uuid = self.instance['uuid']
         self.view_builder = views.servers.ViewBuilder()
         self.request = fakes.HTTPRequest.blank("/v2")
+
+    def test_get_flavor_valid_instance_type(self):
+        flavor_bookmark = "http://localhost/fake/flavors/1"
+        expected = {"id": "1",
+                    "links": [{"rel": "bookmark",
+                               "href": flavor_bookmark}]}
+        result = self.view_builder._get_flavor(self.request, self.instance)
+        self.assertEqual(result, expected)
+
+    def test_get_flavor_deleted_instance_type(self):
+        self.instance['instance_type'] = {}
+        result = self.view_builder._get_flavor(self.request, self.instance)
+        self.assertEqual(result, {})
 
     def test_build_server(self):
         self_link = "http://localhost/v2/fake/servers/%s" % self.uuid

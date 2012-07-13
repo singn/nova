@@ -39,7 +39,6 @@ import threading
 import time
 import types
 import uuid
-import warnings
 from xml.sax import saxutils
 
 from eventlet import corolocal
@@ -47,21 +46,19 @@ from eventlet import event
 from eventlet.green import subprocess
 from eventlet import greenthread
 from eventlet import semaphore
-import iso8601
 import lockfile
 import netaddr
 
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import excutils
 from nova.openstack.common import importutils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 
 
 LOG = logging.getLogger(__name__)
-ISO_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
-PERFECT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
 FLAGS = flags.FLAGS
 
 FLAGS.register_opt(
@@ -115,11 +112,6 @@ def vpn_ping(address, port, timeout=0.05, session_id=None):
     (identifier, server_sess, client_sess) = struct.unpack(fmt, received)
     if identifier == 0x40 and client_sess == session_id:
         return server_sess
-
-
-def fetchfile(url, target):
-    LOG.debug(_('Fetching %s') % url)
-    execute('curl', '--fail', url, '-o', target)
 
 
 def execute(*cmd, **kwargs):
@@ -307,7 +299,7 @@ EASIER_PASSWORD_SYMBOLS = ('23456789',  # Removed: 0, 1
                            'ABCDEFGHJKLMNPQRSTUVWXYZ')  # Removed: I, O
 
 
-def last_completed_audit_period(unit=None):
+def last_completed_audit_period(unit=None, before=None):
     """This method gives you the most recently *completed* audit period.
 
     arguments:
@@ -319,6 +311,8 @@ def last_completed_audit_period(unit=None):
                     like so:  'day@18'  This will begin the period at 18:00
                     UTC.  'month@15' starts a monthly period on the 15th,
                     and year@3 begins a yearly one on March 1st.
+            before: Give the audit period most recently completed before
+                    <timestamp>. Defaults to now.
 
 
     returns:  2 tuple of datetimes (begin, end)
@@ -332,7 +326,10 @@ def last_completed_audit_period(unit=None):
         unit, offset = unit.split("@", 1)
         offset = int(offset)
 
-    rightnow = utcnow()
+    if before is not None:
+        rightnow = before
+    else:
+        rightnow = timeutils.utcnow()
     if unit not in ('month', 'day', 'year', 'hour'):
         raise ValueError('Time period must be hour, day, month or year')
     if unit == 'month':
@@ -445,83 +442,6 @@ def get_my_linklocal(interface):
         msg = _("Couldn't get Link Local IP of %(interface)s"
                 " :%(ex)s") % locals()
         raise exception.NovaException(msg)
-
-
-def utcnow():
-    """Overridable version of utils.utcnow."""
-    if utcnow.override_time:
-        return utcnow.override_time
-    return datetime.datetime.utcnow()
-
-
-utcnow.override_time = None
-
-
-def is_older_than(before, seconds):
-    """Return True if before is older than seconds."""
-    return utcnow() - before > datetime.timedelta(seconds=seconds)
-
-
-def utcnow_ts():
-    """Timestamp version of our utcnow function."""
-    return time.mktime(utcnow().timetuple())
-
-
-def set_time_override(override_time=utcnow()):
-    """Override utils.utcnow to return a constant time."""
-    utcnow.override_time = override_time
-
-
-def advance_time_delta(timedelta):
-    """Advance overriden time using a datetime.timedelta."""
-    assert(not utcnow.override_time is None)
-    utcnow.override_time += timedelta
-
-
-def advance_time_seconds(seconds):
-    """Advance overriden time by seconds."""
-    advance_time_delta(datetime.timedelta(0, seconds))
-
-
-def clear_time_override():
-    """Remove the overridden time."""
-    utcnow.override_time = None
-
-
-def strtime(at=None, fmt=PERFECT_TIME_FORMAT):
-    """Returns formatted utcnow."""
-    if not at:
-        at = utcnow()
-    return at.strftime(fmt)
-
-
-def parse_strtime(timestr, fmt=PERFECT_TIME_FORMAT):
-    """Turn a formatted time back into a datetime."""
-    return datetime.datetime.strptime(timestr, fmt)
-
-
-def isotime(at=None):
-    """Stringify time in ISO 8601 format"""
-    if not at:
-        at = utcnow()
-    str = at.strftime(ISO_TIME_FORMAT)
-    tz = at.tzinfo.tzname(None) if at.tzinfo else 'UTC'
-    str += ('Z' if tz == 'UTC' else tz)
-    return str
-
-
-def parse_isotime(timestr):
-    """Turn an iso formatted time back into a datetime."""
-    try:
-        return iso8601.parse_date(timestr)
-    except (iso8601.ParseError, TypeError) as e:
-        raise ValueError(e.message)
-
-
-def normalize_time(timestamp):
-    """Normalize time in arbitrary timezone to UTC"""
-    offset = timestamp.utcoffset()
-    return timestamp.replace(tzinfo=None) - offset if offset else timestamp
 
 
 def parse_mailmap(mailmap='.mailmap'):
@@ -1121,19 +1041,6 @@ def generate_image_url(image_ref):
 
 
 @contextlib.contextmanager
-def logging_error(message):
-    """Catches exception, write message to the log, re-raise.
-    This is a common refinement of save_and_reraise that writes a specific
-    message to the log.
-    """
-    try:
-        yield
-    except Exception as error:
-        with excutils.save_and_reraise_exception():
-            LOG.exception(message)
-
-
-@contextlib.contextmanager
 def remove_path_on_error(path):
     """Protect code that wants to operate on PATH atomically.
     Any exception will cause PATH to be removed.
@@ -1238,178 +1145,11 @@ def temporary_mutation(obj, **kwargs):
                 setattr(obj, attr, old_value)
 
 
-def warn_deprecated_class(cls, msg):
-    """
-    Issues a warning to indicate that the given class is deprecated.
-    If a message is given, it is appended to the deprecation warning.
-    """
-
-    fullname = '%s.%s' % (cls.__module__, cls.__name__)
-    if msg:
-        fullmsg = _("Class %(fullname)s is deprecated: %(msg)s")
-    else:
-        fullmsg = _("Class %(fullname)s is deprecated")
-
-    # Issue the warning
-    warnings.warn(fullmsg % locals(), DeprecationWarning, stacklevel=3)
-
-
-def warn_deprecated_function(func, msg):
-    """
-    Issues a warning to indicate that the given function is
-    deprecated.  If a message is given, it is appended to the
-    deprecation warning.
-    """
-
-    name = func.__name__
-
-    # Find the function's definition
-    sourcefile = inspect.getsourcefile(func)
-
-    # Find the line number, if possible
-    if inspect.ismethod(func):
-        code = func.im_func.func_code
-    else:
-        code = func.func_code
-    lineno = getattr(code, 'co_firstlineno', None)
-
-    if lineno is None:
-        location = sourcefile
-    else:
-        location = "%s:%d" % (sourcefile, lineno)
-
-    # Build up the message
-    if msg:
-        fullmsg = _("Function %(name)s in %(location)s is deprecated: %(msg)s")
-    else:
-        fullmsg = _("Function %(name)s in %(location)s is deprecated")
-
-    # Issue the warning
-    warnings.warn(fullmsg % locals(), DeprecationWarning, stacklevel=3)
-
-
-def _stubout(klass, message):
-    """
-    Scans a class and generates wrapping stubs for __new__() and every
-    class and static method.  Returns a dictionary which can be passed
-    to type() to generate a wrapping class.
-    """
-
-    overrides = {}
-
-    def makestub_class(name, func):
-        """
-        Create a stub for wrapping class methods.
-        """
-
-        def stub(cls, *args, **kwargs):
-            warn_deprecated_class(klass, message)
-            return func(*args, **kwargs)
-
-        # Overwrite the stub's name
-        stub.__name__ = name
-        stub.func_name = name
-
-        return classmethod(stub)
-
-    def makestub_static(name, func):
-        """
-        Create a stub for wrapping static methods.
-        """
-
-        def stub(*args, **kwargs):
-            warn_deprecated_class(klass, message)
-            return func(*args, **kwargs)
-
-        # Overwrite the stub's name
-        stub.__name__ = name
-        stub.func_name = name
-
-        return staticmethod(stub)
-
-    for name, kind, _klass, _obj in inspect.classify_class_attrs(klass):
-        # We're only interested in __new__(), class methods, and
-        # static methods...
-        if (name != '__new__' and
-            kind not in ('class method', 'static method')):
-            continue
-
-        # Get the function...
-        func = getattr(klass, name)
-
-        # Override it in the class
-        if kind == 'class method':
-            stub = makestub_class(name, func)
-        elif kind == 'static method' or name == '__new__':
-            stub = makestub_static(name, func)
-
-        # Save it in the overrides dictionary...
-        overrides[name] = stub
-
-    # Apply the overrides
-    for name, stub in overrides.items():
-        setattr(klass, name, stub)
-
-
-def deprecated(message=''):
-    """
-    Marks a function, class, or method as being deprecated.  For
-    functions and methods, emits a warning each time the function or
-    method is called.  For classes, generates a new subclass which
-    will emit a warning each time the class is instantiated, or each
-    time any class or static method is called.
-
-    If a message is passed to the decorator, that message will be
-    appended to the emitted warning.  This may be used to suggest an
-    alternate way of achieving the desired effect, or to explain why
-    the function, class, or method is deprecated.
-    """
-
-    def decorator(f_or_c):
-        # Make sure we can deprecate it...
-        if not callable(f_or_c) or isinstance(f_or_c, types.ClassType):
-            warnings.warn("Cannot mark object %r as deprecated" % f_or_c,
-                          DeprecationWarning, stacklevel=2)
-            return f_or_c
-
-        # If we're deprecating a class, create a subclass of it and
-        # stub out all the class and static methods
-        if inspect.isclass(f_or_c):
-            klass = f_or_c
-            _stubout(klass, message)
-            return klass
-
-        # OK, it's a function; use a traditional wrapper...
-        func = f_or_c
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            warn_deprecated_function(func, message)
-
-            return func(*args, **kwargs)
-
-        return wrapper
-    return decorator
-
-
-def _showwarning(message, category, filename, lineno, file=None, line=None):
-    """
-    Redirect warnings into logging.
-    """
-
-    fmtmsg = warnings.formatwarning(message, category, filename, lineno, line)
-    LOG.warning(fmtmsg)
-
-
-# Install our warnings handler
-warnings.showwarning = _showwarning
-
-
 def service_is_up(service):
     """Check whether a service is up based on last heartbeat."""
     last_heartbeat = service['updated_at'] or service['created_at']
     # Timestamps in DB are UTC.
-    elapsed = total_seconds(utcnow() - last_heartbeat)
+    elapsed = total_seconds(timeutils.utcnow() - last_heartbeat)
     return abs(elapsed) <= FLAGS.service_down_time
 
 
@@ -1487,6 +1227,15 @@ def strcmp_const_time(s1, s2):
     for (a, b) in zip(s1, s2):
         result |= ord(a) ^ ord(b)
     return result == 0
+
+
+def sys_platform_translate(arch):
+    """Translate cpu architecture into supported platforms."""
+    if (arch[0] == 'i' and arch[1].isdigit() and arch[2:4] == '86'):
+        arch = 'i686'
+    elif arch.startswith('arm'):
+        arch = 'arm'
+    return arch
 
 
 class UndoManager(object):

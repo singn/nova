@@ -22,8 +22,8 @@ from nova.api.openstack import common
 from nova.api.openstack.compute.views import addresses as views_addresses
 from nova.api.openstack.compute.views import flavors as views_flavors
 from nova.api.openstack.compute.views import images as views_images
-from nova import log as logging
-from nova import utils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 
 
 LOG = logging.getLogger(__name__)
@@ -99,8 +99,8 @@ class ViewBuilder(common.ViewBuilder):
                 "hostId": self._get_host_id(instance) or "",
                 "image": self._get_image(request, instance),
                 "flavor": self._get_flavor(request, instance),
-                "created": utils.isotime(instance["created_at"]),
-                "updated": utils.isotime(instance["updated_at"]),
+                "created": timeutils.isotime(instance["created_at"]),
+                "updated": timeutils.isotime(instance["updated_at"]),
                 "addresses": self._get_addresses(request, instance),
                 "accessIPv4": instance.get("access_ip_v4") or "",
                 "accessIPv6": instance.get("access_ip_v6") or "",
@@ -179,7 +179,12 @@ class ViewBuilder(common.ViewBuilder):
         }
 
     def _get_flavor(self, request, instance):
-        flavor_id = instance["instance_type"]["flavorid"]
+        instance_type = instance["instance_type"]
+        if not instance_type:
+            LOG.warn(_("Instance has had its instance_type removed "
+                    "from the DB"), instance=instance)
+            return {}
+        flavor_id = instance_type["flavorid"]
         flavor_bookmark = self._flavor_builder._get_bookmark_link(request,
                                                                   flavor_id,
                                                                   "flavors")
@@ -199,7 +204,7 @@ class ViewBuilder(common.ViewBuilder):
 
         fault_dict = {
             "code": fault["code"],
-            "created": utils.isotime(fault["created_at"]),
+            "created": timeutils.isotime(fault["created_at"]),
             "message": fault["message"],
         }
 

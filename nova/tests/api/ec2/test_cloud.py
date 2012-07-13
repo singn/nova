@@ -36,11 +36,12 @@ from nova import context
 from nova import db
 from nova import exception
 from nova import flags
-from nova.image import fake
 from nova.image import s3
-from nova import log as logging
-from nova import rpc
+from nova.network import api as network_api
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
 from nova import test
+from nova.tests.image import fake
 from nova import utils
 
 
@@ -93,6 +94,24 @@ class CloudTestCase(test.TestCase):
         self.flags(compute_driver='nova.virt.fake.FakeDriver',
                    stub_network=True)
 
+        def fake_show(meh, context, id):
+            return {'id': id,
+                    'container_format': 'ami',
+                    'properties': {
+                        'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                        'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                        'type': 'machine',
+                        'image_state': 'available'}}
+
+        def fake_detail(_self, context, **kwargs):
+            image = fake_show(None, context, None)
+            image['name'] = kwargs.get('filters', {}).get('name')
+            return [image]
+
+        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
+        fake.stub_out_image_service(self.stubs)
+
         def dumb(*args, **kwargs):
             pass
 
@@ -114,18 +133,6 @@ class CloudTestCase(test.TestCase):
                                               self.project_id,
                                               is_admin=True)
 
-        def fake_show(meh, context, id):
-            return {'id': id,
-                    'container_format': 'ami',
-                    'properties': {
-                        'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
-                        'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
-                        'type': 'machine',
-                        'image_state': 'available'}}
-
-        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'show_by_name', fake_show)
-
         # NOTE(comstud): Make 'cast' behave like a 'call' which will
         # ensure that operations complete
         self.stubs.Set(rpc, 'cast', rpc.call)
@@ -135,6 +142,10 @@ class CloudTestCase(test.TestCase):
                                'cedef40a-ed67-4d10-800e-17455edce175')
         db.api.s3_image_create(self.context,
                                '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6')
+
+    def tearDown(self):
+        super(CloudTestCase, self).tearDown()
+        fake.FakeImageService_reset()
 
     def _stub_instance_get_with_fixed_ips(self, func_name):
         orig_func = getattr(self.cloud.compute_api, func_name)
@@ -233,8 +244,14 @@ class CloudTestCase(test.TestCase):
                                                  project_id=project_id)
 
         fixed_ips = nw_info.fixed_ips()
+        ec2_id = ec2utils.id_to_ec2_inst_id(inst['id'])
 
-        ec2_id = ec2utils.id_to_ec2_id(inst['id'])
+        self.stubs.Set(ec2utils, 'get_ip_info_for_instance',
+                       lambda *args: {'fixed_ips': ['10.0.0.1'],
+                                      'fixed_ip6s': [],
+                                      'floating_ips': []})
+        self.stubs.Set(network_api.API, 'get_instance_id_by_floating_address',
+                       lambda *args: 1)
         self.cloud.associate_address(self.context,
                                      instance_id=ec2_id,
                                      public_ip=address)
@@ -295,7 +312,7 @@ class CloudTestCase(test.TestCase):
 
     def test_security_group_quota_limit(self):
         self.flags(quota_security_groups=10)
-        for i in range(1, 10):
+        for i in range(1, FLAGS.quota_security_groups + 1):
             name = 'test name %i' % i
             descript = 'test description %i' % i
             create = self.cloud.create_security_group
@@ -743,7 +760,7 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(len(result['instancesSet']), 2)
 
         # Now try filtering.
-        instance_id = ec2utils.id_to_ec2_id(inst2['id'])
+        instance_id = ec2utils.id_to_ec2_inst_id(inst2['uuid'])
         result = self.cloud.describe_instances(self.context,
                                              instance_id=[instance_id])
         result = result['reservationSet'][0]
@@ -831,7 +848,7 @@ class CloudTestCase(test.TestCase):
                            'power_state': power_state_, 'vm_state': vm_state_})
             inst = db.instance_create(self.context, values)
 
-            instance_id = ec2utils.id_to_ec2_id(inst['id'])
+            instance_id = ec2utils.id_to_ec2_inst_id(inst['uuid'])
             result = self.cloud.describe_instances(self.context,
                                                  instance_id=[instance_id])
             result = result['reservationSet'][0]
@@ -846,10 +863,8 @@ class CloudTestCase(test.TestCase):
 
         test_instance_state(inst_state.RUNNING_CODE, inst_state.RUNNING,
                             power_state.RUNNING, vm_states.ACTIVE)
-        test_instance_state(inst_state.TERMINATED_CODE, inst_state.SHUTOFF,
-                            power_state.NOSTATE, vm_states.SHUTOFF)
         test_instance_state(inst_state.STOPPED_CODE, inst_state.STOPPED,
-                            power_state.NOSTATE, vm_states.SHUTOFF,
+                            power_state.NOSTATE, vm_states.STOPPED,
                             {'shutdown_terminate': False})
 
     def test_describe_instances_no_ipv6(self):
@@ -871,7 +886,7 @@ class CloudTestCase(test.TestCase):
         result = result['reservationSet'][0]
         self.assertEqual(len(result['instancesSet']), 1)
         instance = result['instancesSet'][0]
-        instance_id = ec2utils.id_to_ec2_id(inst1['id'])
+        instance_id = ec2utils.id_to_ec2_inst_id(inst1['uuid'])
         self.assertEqual(instance['instanceId'], instance_id)
         self.assertEqual(instance['publicDnsName'], '1.2.3.4')
         self.assertEqual(instance['ipAddress'], '1.2.3.4')
@@ -901,7 +916,7 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(len(result['reservationSet']), 1)
         result1 = result['reservationSet'][0]['instancesSet']
         self.assertEqual(result1[0]['instanceId'],
-                         ec2utils.id_to_ec2_id(inst2.id))
+                         ec2utils.id_to_ec2_inst_id(inst2['uuid']))
 
     def test_describe_instances_with_image_deleted(self):
         image_uuid = 'aebef54a-ed67-4d10-912f-14455edce176'
@@ -1003,7 +1018,6 @@ class CloudTestCase(test.TestCase):
         db.instance_destroy(self.context, inst2['uuid'])
         db.instance_destroy(self.context, inst1['uuid'])
 
-    # NOTE(jdg) Modified expected volume_id's to string
     _expected_instance_bdm1 = {
         'instanceId': 'i-00000001',
         'rootDeviceName': '/dev/sdb1',
@@ -1068,7 +1082,7 @@ class CloudTestCase(test.TestCase):
         self._tearDownBlockDeviceMapping(inst1, inst2, volumes)
 
     def _assertInstance(self, instance_id):
-        ec2_instance_id = ec2utils.id_to_ec2_id(instance_id)
+        ec2_instance_id = ec2utils.id_to_ec2_inst_id(instance_id)
         result = self.cloud.describe_instances(self.context,
                                                instance_id=[ec2_instance_id])
         result = result['reservationSet'][0]
@@ -1094,12 +1108,12 @@ class CloudTestCase(test.TestCase):
         """
         (inst1, inst2, volumes) = self._setUpBlockDeviceMapping()
 
-        result = self._assertInstance(inst1['id'])
+        result = self._assertInstance(inst1['uuid'])
         self.assertSubDictMatch(self._expected_instance_bdm1, result)
         self._assertEqualBlockDeviceMapping(
             self._expected_block_device_mapping0, result['blockDeviceMapping'])
 
-        result = self._assertInstance(inst2['id'])
+        result = self._assertInstance(inst2['uuid'])
         self.assertSubDictMatch(self._expected_instance_bdm2, result)
 
         self._tearDownBlockDeviceMapping(inst1, inst2, volumes)
@@ -1118,6 +1132,9 @@ class CloudTestCase(test.TestCase):
         def fake_show_none(meh, context, id):
             raise exception.ImageNotFound(image_id='bad_image_id')
 
+        def fake_detail_none(self, context, **kwargs):
+            return []
+
         self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
         # list all
         result1 = describe_images(self.context)
@@ -1133,7 +1150,7 @@ class CloudTestCase(test.TestCase):
         # provide a non-existing image_id
         self.stubs.UnsetAll()
         self.stubs.Set(fake._FakeImageService, 'show', fake_show_none)
-        self.stubs.Set(fake._FakeImageService, 'show_by_name', fake_show_none)
+        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail_none)
         self.assertRaises(exception.ImageNotFound, describe_images,
                           self.context, ['ami-fake'])
 
@@ -1201,7 +1218,7 @@ class CloudTestCase(test.TestCase):
                     return i
             raise exception.ImageNotFound(image_id=image_id)
 
-        def fake_detail(meh, context):
+        def fake_detail(meh, context, **kwargs):
             return [copy.deepcopy(image1), copy.deepcopy(image2)]
 
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
@@ -1303,8 +1320,13 @@ class CloudTestCase(test.TestCase):
                     'container_format': 'ami',
                     'is_public': True}
 
+        def fake_detail(self, context, **kwargs):
+            image = fake_show(None, context, None)
+            image['name'] = kwargs.get('filters', {}).get('name')
+            return [image]
+
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'show_by_name', fake_show)
+        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
         result = describe_image_attribute(self.context, 'ami-00000001',
                                           'launchPermission')
         self.assertEqual([{'group': 'all'}], result['launchPermission'])
@@ -1350,6 +1372,11 @@ class CloudTestCase(test.TestCase):
         def fake_show(meh, context, id):
             return copy.deepcopy(fake_metadata)
 
+        def fake_detail(self, context, **kwargs):
+            image = fake_show(None, context, None)
+            image['name'] = kwargs.get('filters', {}).get('name')
+            return [image]
+
         def fake_update(meh, context, image_id, metadata, data=None):
             self.assertEqual(metadata['properties']['kernel_id'],
                              fake_metadata['properties']['kernel_id'])
@@ -1361,7 +1388,7 @@ class CloudTestCase(test.TestCase):
             return image
 
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'show_by_name', fake_show)
+        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
         self.stubs.Set(fake._FakeImageService, 'update', fake_update)
         result = modify_image_attribute(self.context, 'ami-00000001',
                                           'launchPermission', 'add',
@@ -1463,7 +1490,7 @@ class CloudTestCase(test.TestCase):
         # invalid image
         self.stubs.UnsetAll()
 
-        def fake_detail_empty(self, context):
+        def fake_detail_empty(self, context, **kwargs):
             return []
 
         self.stubs.Set(fake._FakeImageService, 'detail', fake_detail_empty)
@@ -1613,7 +1640,6 @@ class CloudTestCase(test.TestCase):
                     'container_format': 'ami',
                     'status': 'active'}
 
-        self.stubs.UnsetAll()
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
 
         def dumb(*args, **kwargs):
@@ -1718,7 +1744,11 @@ class CloudTestCase(test.TestCase):
                         'type': 'machine'},
                     'status': 'active'}
 
+        def fake_id_to_glance_id(context, id):
+            return 'cedef40a-ed67-4d10-800e-17455edce175'
+
         self.stubs.Set(fake._FakeImageService, 'show', fake_show_stat_active)
+        self.stubs.Set(ec2utils, 'id_to_glance_id', fake_id_to_glance_id)
 
         result = run_instances(self.context, **kwargs)
         self.assertEqual(len(result['instancesSet']), 1)
@@ -1844,8 +1874,9 @@ class CloudTestCase(test.TestCase):
                   'max_count': 1, }
         instance_id = self._run_instance(**kwargs)
 
-        internal_id = ec2utils.ec2_id_to_id(instance_id)
-        instance = db.instance_update(self.context, internal_id,
+        internal_uuid = db.get_instance_uuid_by_ec2_id(self.context,
+                    ec2utils.ec2_id_to_id(instance_id))
+        instance = db.instance_update(self.context, internal_uuid,
                                       {'disable_terminate': True})
 
         expected = {'instancesSet': [
@@ -1857,7 +1888,7 @@ class CloudTestCase(test.TestCase):
         result = self.cloud.terminate_instances(self.context, [instance_id])
         self.assertEqual(result, expected)
 
-        instance = db.instance_update(self.context, internal_id,
+        instance = db.instance_update(self.context, internal_uuid,
                                       {'disable_terminate': False})
 
         expected = {'instancesSet': [
@@ -2304,7 +2335,7 @@ class CloudTestCase(test.TestCase):
             self.assertEqual(result, expected)
             self._restart_compute_service()
 
-        test_dia_iisb('terminate', image_id='ami-1')
+        test_dia_iisb('stop', image_id='ami-1')
 
         block_device_mapping = [{'device_name': '/dev/vdb',
                                  'virtual_name': 'ephemeral0'}]
@@ -2347,10 +2378,9 @@ class CloudTestCase(test.TestCase):
         for i in range(3, 7):
             db.api.s3_image_create(self.context, 'ami-%d' % i)
 
-        self.stubs.UnsetAll()
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
 
-        test_dia_iisb('terminate', image_id='ami-3')
+        test_dia_iisb('stop', image_id='ami-3')
         test_dia_iisb('stop', image_id='ami-4')
         test_dia_iisb('stop', image_id='ami-5')
         test_dia_iisb('stop', image_id='ami-6')

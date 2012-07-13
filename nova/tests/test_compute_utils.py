@@ -22,12 +22,12 @@ from nova.compute import utils as compute_utils
 from nova import context
 from nova import db
 from nova import flags
-import nova.image.fake
-from nova import log as logging
-from nova.notifier import test_notifier
 from nova.openstack.common import importutils
+from nova.openstack.common import log as logging
+from nova.openstack.common.notifier import test_notifier
 from nova import test
 from nova.tests import fake_network
+import nova.tests.image.fake
 from nova import utils
 
 
@@ -50,7 +50,7 @@ class UsageInfoTestCase(test.TestCase):
 
         self.flags(compute_driver='nova.virt.fake.FakeDriver',
                    stub_network=True,
-                   notification_driver='nova.notifier.test_notifier',
+            notification_driver='nova.openstack.common.notifier.test_notifier',
                    network_manager='nova.network.manager.FlatManager')
         self.compute = importutils.import_object(FLAGS.compute_manager)
         self.user_id = 'fake'
@@ -61,7 +61,8 @@ class UsageInfoTestCase(test.TestCase):
         def fake_show(meh, context, id):
             return {'id': 1, 'properties': {'kernel_id': 1, 'ramdisk_id': 1}}
 
-        self.stubs.Set(nova.image.fake._FakeImageService, 'show', fake_show)
+        self.stubs.Set(nova.tests.image.fake._FakeImageService,
+                       'show', fake_show)
 
     def _create_instance(self, params={}):
         """Create a test instance"""
@@ -112,3 +113,64 @@ class UsageInfoTestCase(test.TestCase):
         image_ref_url = "%s/images/1" % utils.generate_glance_url()
         self.assertEquals(payload['image_ref_url'], image_ref_url)
         self.compute.terminate_instance(self.context, instance['uuid'])
+
+    def test_notify_usage_exists_deleted_instance(self):
+        """Ensure 'exists' notification generates appropriate usage data."""
+        instance_id = self._create_instance()
+        instance = db.instance_get(self.context, instance_id)
+        # Set some system metadata
+        sys_metadata = {'image_md_key1': 'val1',
+                        'image_md_key2': 'val2',
+                        'other_data': 'meow'}
+        db.instance_system_metadata_update(self.context, instance['uuid'],
+                sys_metadata, False)
+        self.compute.terminate_instance(self.context, instance['uuid'])
+        instance = db.instance_get(self.context.elevated(read_deleted='yes'),
+                                   instance_id)
+        compute_utils.notify_usage_exists(self.context, instance)
+        msg = test_notifier.NOTIFICATIONS[-1]
+        self.assertEquals(msg['priority'], 'INFO')
+        self.assertEquals(msg['event_type'], 'compute.instance.exists')
+        payload = msg['payload']
+        self.assertEquals(payload['tenant_id'], self.project_id)
+        self.assertEquals(payload['user_id'], self.user_id)
+        self.assertEquals(payload['instance_id'], instance.uuid)
+        self.assertEquals(payload['instance_type'], 'm1.tiny')
+        type_id = instance_types.get_instance_type_by_name('m1.tiny')['id']
+        self.assertEquals(str(payload['instance_type_id']), str(type_id))
+        for attr in ('display_name', 'created_at', 'launched_at',
+                     'state', 'state_description',
+                     'bandwidth', 'audit_period_beginning',
+                     'audit_period_ending', 'image_meta'):
+            self.assertTrue(attr in payload,
+                            msg="Key %s not in payload" % attr)
+        self.assertEquals(payload['image_meta'],
+                {'md_key1': 'val1', 'md_key2': 'val2'})
+        image_ref_url = "%s/images/1" % utils.generate_glance_url()
+        self.assertEquals(payload['image_ref_url'], image_ref_url)
+
+    def test_notify_usage_exists_instance_not_found(self):
+        """Ensure 'exists' notification generates appropriate usage data."""
+        instance_id = self._create_instance()
+        instance = db.instance_get(self.context, instance_id)
+        self.compute.terminate_instance(self.context, instance['uuid'])
+        compute_utils.notify_usage_exists(self.context, instance)
+        msg = test_notifier.NOTIFICATIONS[-1]
+        self.assertEquals(msg['priority'], 'INFO')
+        self.assertEquals(msg['event_type'], 'compute.instance.exists')
+        payload = msg['payload']
+        self.assertEquals(payload['tenant_id'], self.project_id)
+        self.assertEquals(payload['user_id'], self.user_id)
+        self.assertEquals(payload['instance_id'], instance.uuid)
+        self.assertEquals(payload['instance_type'], 'm1.tiny')
+        type_id = instance_types.get_instance_type_by_name('m1.tiny')['id']
+        self.assertEquals(str(payload['instance_type_id']), str(type_id))
+        for attr in ('display_name', 'created_at', 'launched_at',
+                     'state', 'state_description',
+                     'bandwidth', 'audit_period_beginning',
+                     'audit_period_ending', 'image_meta'):
+            self.assertTrue(attr in payload,
+                            msg="Key %s not in payload" % attr)
+        self.assertEquals(payload['image_meta'], {})
+        image_ref_url = "%s/images/1" % utils.generate_glance_url()
+        self.assertEquals(payload['image_ref_url'], image_ref_url)

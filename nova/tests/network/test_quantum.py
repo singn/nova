@@ -23,13 +23,13 @@ from nova.db.sqlalchemy import models
 from nova.db.sqlalchemy import session as sql_session
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.network.quantum import client as quantum_client
 from nova.network.quantum import fake_client
 from nova.network.quantum import manager as quantum_manager
 from nova.network.quantum import melange_connection
 from nova.network.quantum import melange_ipam_lib
 from nova.network.quantum import quantum_connection
+from nova.openstack.common import log as logging
 
 from nova import test
 from nova import utils
@@ -291,7 +291,7 @@ class QuantumDeallocationTestCase(QuantumNovaTestCase):
         self.net_man.deallocate_ip_address('context', 'net_id', 'project_id',
                 {'uuid': 1}, 'instance_id')
 
-    def test_deallocate_ip_address(self):
+    def test_deallocate_ip_address_2(self):
         ipam = self.mox.CreateMock(melange_ipam_lib.QuantumMelangeIPAMLib)
         ipam.get_tenant_id_by_net_id('context', 'net_id', {'uuid': 1},
                                      'project_id').AndRaise(Exception())

@@ -32,6 +32,7 @@ import mox
 import nova
 from nova import exception
 from nova import flags
+from nova.openstack.common import timeutils
 from nova import test
 from nova import utils
 
@@ -416,6 +417,51 @@ class GenericUtilsTestCase(test.TestCase):
                 self.assertEqual(fake_execute.uid, 2)
             self.assertEqual(fake_execute.uid, os.getuid())
 
+    def test_service_is_up(self):
+        fts_func = datetime.datetime.fromtimestamp
+        fake_now = 1000
+        down_time = 5
+
+        self.flags(service_down_time=down_time)
+        self.mox.StubOutWithMock(timeutils, 'utcnow')
+
+        # Up (equal)
+        timeutils.utcnow().AndReturn(fts_func(fake_now))
+        service = {'updated_at': fts_func(fake_now - down_time),
+                   'created_at': fts_func(fake_now - down_time)}
+        self.mox.ReplayAll()
+        result = utils.service_is_up(service)
+        self.assertTrue(result)
+
+        self.mox.ResetAll()
+        # Up
+        timeutils.utcnow().AndReturn(fts_func(fake_now))
+        service = {'updated_at': fts_func(fake_now - down_time + 1),
+                   'created_at': fts_func(fake_now - down_time + 1)}
+        self.mox.ReplayAll()
+        result = utils.service_is_up(service)
+        self.assertTrue(result)
+
+        self.mox.ResetAll()
+        # Down
+        timeutils.utcnow().AndReturn(fts_func(fake_now))
+        service = {'updated_at': fts_func(fake_now - down_time - 1),
+                   'created_at': fts_func(fake_now - down_time - 1)}
+        self.mox.ReplayAll()
+        result = utils.service_is_up(service)
+        self.assertFalse(result)
+
+    def test_xhtml_escape(self):
+        self.assertEqual('&quot;foo&quot;', utils.xhtml_escape('"foo"'))
+        self.assertEqual('&apos;foo&apos;', utils.xhtml_escape("'foo'"))
+
+    def test_hash_file(self):
+        data = 'Mary had a little lamb, its fleece as white as snow'
+        flo = StringIO.StringIO(data)
+        h1 = utils.hash_file(flo)
+        h2 = hashlib.sha1(data).hexdigest()
+        self.assertEquals(h1, h2)
+
 
 class IsUUIDLikeTestCase(test.TestCase):
     def assertUUIDLike(self, val, expected):
@@ -485,266 +531,6 @@ class MonkeyPatchTestCase(test.TestCase):
             in nova.tests.monkey_patch_example.CALLED_FUNCTION)
         self.assertFalse(package_b + 'ExampleClassB.example_method_add'
             in nova.tests.monkey_patch_example.CALLED_FUNCTION)
-
-
-class DeprecationTest(test.TestCase):
-    def setUp(self):
-        super(DeprecationTest, self).setUp()
-
-        def fake_warn_deprecated_class(cls, msg):
-            self.warn = ('class', cls, msg)
-
-        def fake_warn_deprecated_function(func, msg):
-            self.warn = ('function', func, msg)
-
-        self.stubs.Set(utils, 'warn_deprecated_class',
-                       fake_warn_deprecated_class)
-        self.stubs.Set(utils, 'warn_deprecated_function',
-                       fake_warn_deprecated_function)
-        self.warn = None
-
-    def test_deprecated_function_no_message(self):
-        def test_function():
-            pass
-
-        decorated = utils.deprecated()(test_function)
-
-        decorated()
-        self.assertEqual(self.warn, ('function', test_function, ''))
-
-    def test_deprecated_function_with_message(self):
-        def test_function():
-            pass
-
-        decorated = utils.deprecated('string')(test_function)
-
-        decorated()
-        self.assertEqual(self.warn, ('function', test_function, 'string'))
-
-    def test_deprecated_class_no_message(self):
-        @utils.deprecated()
-        class TestClass(object):
-            pass
-
-        TestClass()
-        self.assertEqual(self.warn, ('class', TestClass, ''))
-
-    def test_deprecated_class_with_message(self):
-        @utils.deprecated('string')
-        class TestClass(object):
-            pass
-
-        TestClass()
-        self.assertEqual(self.warn, ('class', TestClass, 'string'))
-
-    def test_deprecated_classmethod_no_message(self):
-        @utils.deprecated()
-        class TestClass(object):
-            @classmethod
-            def class_method(cls):
-                pass
-
-        TestClass.class_method()
-        self.assertEqual(self.warn, ('class', TestClass, ''))
-
-    def test_deprecated_classmethod_with_message(self):
-        @utils.deprecated('string')
-        class TestClass(object):
-            @classmethod
-            def class_method(cls):
-                pass
-
-        TestClass.class_method()
-        self.assertEqual(self.warn, ('class', TestClass, 'string'))
-
-    def test_deprecated_staticmethod_no_message(self):
-        @utils.deprecated()
-        class TestClass(object):
-            @staticmethod
-            def static_method():
-                pass
-
-        TestClass.static_method()
-        self.assertEqual(self.warn, ('class', TestClass, ''))
-
-    def test_deprecated_staticmethod_with_message(self):
-        @utils.deprecated('string')
-        class TestClass(object):
-            @staticmethod
-            def static_method():
-                pass
-
-        TestClass.static_method()
-        self.assertEqual(self.warn, ('class', TestClass, 'string'))
-
-    def test_deprecated_instancemethod(self):
-        @utils.deprecated()
-        class TestClass(object):
-            def instance_method(self):
-                pass
-
-        # Instantiate the class...
-        obj = TestClass()
-        self.assertEqual(self.warn, ('class', TestClass, ''))
-
-        # Reset warn...
-        self.warn = None
-
-        # Call the instance method...
-        obj.instance_method()
-
-        # Make sure that did *not* generate a warning
-        self.assertEqual(self.warn, None)
-
-    def test_service_is_up(self):
-        fts_func = datetime.datetime.fromtimestamp
-        fake_now = 1000
-        down_time = 5
-
-        self.flags(service_down_time=down_time)
-        self.mox.StubOutWithMock(utils, 'utcnow')
-
-        # Up (equal)
-        utils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time),
-                   'created_at': fts_func(fake_now - down_time)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertTrue(result)
-
-        self.mox.ResetAll()
-        # Up
-        utils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time + 1),
-                   'created_at': fts_func(fake_now - down_time + 1)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertTrue(result)
-
-        self.mox.ResetAll()
-        # Down
-        utils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time - 1),
-                   'created_at': fts_func(fake_now - down_time - 1)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertFalse(result)
-
-    def test_xhtml_escape(self):
-        self.assertEqual('&quot;foo&quot;', utils.xhtml_escape('"foo"'))
-        self.assertEqual('&apos;foo&apos;', utils.xhtml_escape("'foo'"))
-
-    def test_hash_file(self):
-        data = 'Mary had a little lamb, its fleece as white as snow'
-        flo = StringIO.StringIO(data)
-        h1 = utils.hash_file(flo)
-        h2 = hashlib.sha1(data).hexdigest()
-        self.assertEquals(h1, h2)
-
-
-class Iso8601TimeTest(test.TestCase):
-
-    def _instaneous(self, timestamp, yr, mon, day, hr, min, sec, micro):
-        self.assertEquals(timestamp.year, yr)
-        self.assertEquals(timestamp.month, mon)
-        self.assertEquals(timestamp.day, day)
-        self.assertEquals(timestamp.hour, hr)
-        self.assertEquals(timestamp.minute, min)
-        self.assertEquals(timestamp.second, sec)
-        self.assertEquals(timestamp.microsecond, micro)
-
-    def _do_test(self, str, yr, mon, day, hr, min, sec, micro, shift):
-        DAY_SECONDS = 24 * 60 * 60
-        timestamp = utils.parse_isotime(str)
-        self._instaneous(timestamp, yr, mon, day, hr, min, sec, micro)
-        offset = timestamp.tzinfo.utcoffset(None)
-        self.assertEqual(offset.seconds + offset.days * DAY_SECONDS, shift)
-
-    def test_zulu(self):
-        str = '2012-02-14T20:53:07Z'
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 0, 0)
-
-    def test_zulu_micros(self):
-        str = '2012-02-14T20:53:07.123Z'
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 123000, 0)
-
-    def test_offset_east(self):
-        str = '2012-02-14T20:53:07+04:30'
-        offset = 4.5 * 60 * 60
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 0, offset)
-
-    def test_offset_east_micros(self):
-        str = '2012-02-14T20:53:07.42+04:30'
-        offset = 4.5 * 60 * 60
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 420000, offset)
-
-    def test_offset_west(self):
-        str = '2012-02-14T20:53:07-05:30'
-        offset = -5.5 * 60 * 60
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 0, offset)
-
-    def test_offset_west_micros(self):
-        str = '2012-02-14T20:53:07.654321-05:30'
-        offset = -5.5 * 60 * 60
-        self._do_test(str, 2012, 02, 14, 20, 53, 7, 654321, offset)
-
-    def test_compare(self):
-        zulu = utils.parse_isotime('2012-02-14T20:53:07')
-        east = utils.parse_isotime('2012-02-14T20:53:07-01:00')
-        west = utils.parse_isotime('2012-02-14T20:53:07+01:00')
-        self.assertTrue(east > west)
-        self.assertTrue(east > zulu)
-        self.assertTrue(zulu > west)
-
-    def test_compare_micros(self):
-        zulu = utils.parse_isotime('2012-02-14T20:53:07.6544')
-        east = utils.parse_isotime('2012-02-14T19:53:07.654321-01:00')
-        west = utils.parse_isotime('2012-02-14T21:53:07.655+01:00')
-        self.assertTrue(east < west)
-        self.assertTrue(east < zulu)
-        self.assertTrue(zulu < west)
-
-    def test_zulu_roundtrip(self):
-        str = '2012-02-14T20:53:07Z'
-        zulu = utils.parse_isotime(str)
-        self.assertEquals(zulu.tzinfo, iso8601.iso8601.UTC)
-        self.assertEquals(utils.isotime(zulu), str)
-
-    def test_east_roundtrip(self):
-        str = '2012-02-14T20:53:07-07:00'
-        east = utils.parse_isotime(str)
-        self.assertEquals(east.tzinfo.tzname(None), '-07:00')
-        self.assertEquals(utils.isotime(east), str)
-
-    def test_west_roundtrip(self):
-        str = '2012-02-14T20:53:07+11:30'
-        west = utils.parse_isotime(str)
-        self.assertEquals(west.tzinfo.tzname(None), '+11:30')
-        self.assertEquals(utils.isotime(west), str)
-
-    def test_now_roundtrip(self):
-        str = utils.isotime()
-        now = utils.parse_isotime(str)
-        self.assertEquals(now.tzinfo, iso8601.iso8601.UTC)
-        self.assertEquals(utils.isotime(now), str)
-
-    def test_zulu_normalize(self):
-        str = '2012-02-14T20:53:07Z'
-        zulu = utils.parse_isotime(str)
-        normed = utils.normalize_time(zulu)
-        self._instaneous(normed, 2012, 2, 14, 20, 53, 07, 0)
-
-    def test_east_normalize(self):
-        str = '2012-02-14T20:53:07-07:00'
-        east = utils.parse_isotime(str)
-        normed = utils.normalize_time(east)
-        self._instaneous(normed, 2012, 2, 15, 03, 53, 07, 0)
-
-    def test_west_normalize(self):
-        str = '2012-02-14T20:53:07+21:00'
-        west = utils.parse_isotime(str)
-        normed = utils.normalize_time(west)
-        self._instaneous(normed, 2012, 2, 13, 23, 53, 07, 0)
 
 
 class TestGreenLocks(test.TestCase):
@@ -947,10 +733,10 @@ class AuditPeriodTest(test.TestCase):
                                            day=5,
                                            month=3,
                                            year=2012)
-        utils.set_time_override(override_time=self.test_time)
+        timeutils.set_time_override(override_time=self.test_time)
 
     def tearDown(self):
-        utils.clear_time_override()
+        timeutils.clear_time_override()
         super(AuditPeriodTest, self).tearDown()
 
     def test_hour(self):

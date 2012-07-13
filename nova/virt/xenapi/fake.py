@@ -58,9 +58,9 @@ from xml.sax import saxutils
 import pprint
 
 from nova import exception
-from nova import log as logging
 from nova.openstack.common import jsonutils
-from nova import utils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 
 
 _CLASSES = ['host', 'network', 'session', 'pool', 'SR', 'VBD',
@@ -127,17 +127,37 @@ def destroy_vm(vm_ref):
     vm_rec = _db_content['VM'][vm_ref]
 
     vbd_refs = vm_rec['VBDs']
-    for vbd_ref in vbd_refs:
+    # NOTE(johannes): Shallow copy since destroy_vbd will remove itself
+    # from the list
+    for vbd_ref in vbd_refs[:]:
         destroy_vbd(vbd_ref)
 
     del _db_content['VM'][vm_ref]
 
 
 def destroy_vbd(vbd_ref):
+    vbd_rec = _db_content['VBD'][vbd_ref]
+
+    vm_ref = vbd_rec['VM']
+    vm_rec = _db_content['VM'][vm_ref]
+    vm_rec['VBDs'].remove(vbd_ref)
+
+    vdi_ref = vbd_rec['VDI']
+    vdi_rec = _db_content['VDI'][vdi_ref]
+    vdi_rec['VBDs'].remove(vbd_ref)
+
     del _db_content['VBD'][vbd_ref]
 
 
 def destroy_vdi(vdi_ref):
+    vdi_rec = _db_content['VDI'][vdi_ref]
+
+    vbd_refs = vdi_rec['VBDs']
+    # NOTE(johannes): Shallow copy since destroy_vbd will remove itself
+    # from the list
+    for vbd_ref in vbd_refs[:]:
+        destroy_vbd(vbd_ref)
+
     del _db_content['VDI'][vdi_ref]
 
 
@@ -155,10 +175,15 @@ def create_vdi(name_label, sr_ref, **kwargs):
         'sm_config': {},
         'physical_utilisation': '123',
         'managed': True,
-        'VBDs': {},
     }
     vdi_rec.update(kwargs)
-    return _create_object('VDI', vdi_rec)
+    vdi_ref = _create_object('VDI', vdi_rec)
+    after_VDI_create(vdi_ref, vdi_rec)
+    return vdi_ref
+
+
+def after_VDI_create(vdi_ref, vdi_rec):
+    vdi_rec.setdefault('VBDs', [])
 
 
 def create_vbd(vm_ref, vdi_ref, userdevice=0):
@@ -172,13 +197,18 @@ def create_vbd(vm_ref, vdi_ref, userdevice=0):
 
 
 def after_VBD_create(vbd_ref, vbd_rec):
-    """Create read-only fields and backref from VM to VBD when VBD is
-    created."""
+    """Create read-only fields and backref from VM and VDI to VBD when VBD
+    is created."""
     vbd_rec['currently_attached'] = False
     vbd_rec['device'] = ''
+
     vm_ref = vbd_rec['VM']
     vm_rec = _db_content['VM'][vm_ref]
     vm_rec['VBDs'].append(vbd_ref)
+
+    vdi_ref = vbd_rec['VDI']
+    vdi_rec = _db_content['VDI'][vdi_ref]
+    vdi_rec['VBDs'].append(vbd_ref)
 
     vm_name_label = _db_content['VM'][vm_ref]['name_label']
     vbd_rec['vm_name_label'] = vm_name_label
@@ -276,16 +306,17 @@ def _create_object(table, obj):
 def _create_sr(table, obj):
     sr_type = obj[6]
     # Forces fake to support iscsi only
-    if sr_type != 'iscsi':
+    if sr_type != 'iscsi' and sr_type != 'nfs':
         raise Failure(['SR_UNKNOWN_DRIVER', sr_type])
     host_ref = _db_content['host'].keys()[0]
     sr_ref = _create_object(table, obj[2])
-    vdi_ref = create_vdi('', sr_ref)
-    pbd_ref = create_pbd('', host_ref, sr_ref, True)
-    _db_content['SR'][sr_ref]['VDIs'] = [vdi_ref]
-    _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
-    _db_content['VDI'][vdi_ref]['SR'] = sr_ref
-    _db_content['PBD'][pbd_ref]['SR'] = sr_ref
+    if sr_type == 'iscsi':
+        vdi_ref = create_vdi('', sr_ref)
+        pbd_ref = create_pbd('', host_ref, sr_ref, True)
+        _db_content['SR'][sr_ref]['VDIs'] = [vdi_ref]
+        _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
+        _db_content['VDI'][vdi_ref]['SR'] = sr_ref
+        _db_content['PBD'][pbd_ref]['SR'] = sr_ref
     return sr_ref
 
 
@@ -468,6 +499,9 @@ class SessionBase(object):
         db_ref = _db_content['VDI'][vdi_ref]
         if not 'other_config' in db_ref:
             db_ref['other_config'] = {}
+        if key in db_ref['other_config']:
+            raise Failure(['MAP_DUPLICATE_KEY', 'VDI', 'other_config',
+                           vdi_ref, key])
         db_ref['other_config'][key] = value
 
     def VDI_copy(self, _1, vdi_to_copy_ref, sr_ref):
@@ -497,13 +531,13 @@ class SessionBase(object):
             return as_json(returncode='0', message='success')
         elif (plugin, method) == ('agent', 'resetnetwork'):
             return as_json(returncode='0', message='success')
-        elif (plugin, method) == ('glance', 'copy_kernel_vdi'):
-            return ''
         elif (plugin, method) == ('glance', 'upload_vhd'):
             return ''
-        elif (plugin, method) == ('glance', 'create_kernel_ramdisk'):
+        elif (plugin, method) == ('kernel', 'copy_vdi'):
             return ''
-        elif (plugin, method) == ('glance', 'remove_kernel_ramdisk'):
+        elif (plugin, method) == ('kernel', 'create_kernel_ramdisk'):
+            return ''
+        elif (plugin, method) == ('kernel', 'remove_kernel_ramdisk'):
             return ''
         elif (plugin, method) == ('migration', 'move_vhds_into_sr'):
             return ''
@@ -521,6 +555,8 @@ class SessionBase(object):
         elif (plugin, method) == ('xenhost', 'set_host_enabled'):
             enabled = 'enabled' if _5.get('enabled') == 'true' else 'disabled'
             return jsonutils.dumps({"status": enabled})
+        elif (plugin, method) == ('xenhost', 'host_uptime'):
+            return jsonutils.dumps({"uptime": "fake uptime"})
         else:
             raise Exception('No simulation in host_call_plugin for %s,%s' %
                             (plugin, method))
@@ -533,8 +569,18 @@ class SessionBase(object):
 
     VDI_resize = VDI_resize_online
 
+    def _VM_reboot(self, session, vm_ref):
+        db_ref = _db_content['VM'][vm_ref]
+        if db_ref['power_state'] != 'Running':
+            raise Failure(['VM_BAD_POWER_STATE',
+                'fake-opaque-ref', db_ref['power_state'].lower(), 'halted'])
+        db_ref['power_state'] = 'Running'
+
     def VM_clean_reboot(self, session, vm_ref):
-        pass
+        return self._VM_reboot(session, vm_ref)
+
+    def VM_hard_reboot(self, session, vm_ref):
+        return self._VM_reboot(session, vm_ref)
 
     def VM_hard_shutdown(self, session, vm_ref):
         db_ref = _db_content['VM'][vm_ref]
@@ -724,7 +770,13 @@ class SessionBase(object):
         ref = params[1]
         if ref not in _db_content[table]:
             raise Failure(['HANDLE_INVALID', table, ref])
-        del _db_content[table][ref]
+
+        # Call destroy function (if exists)
+        destroy_func = globals().get('destroy_%s' % table.lower())
+        if destroy_func:
+            destroy_func(ref)
+        else:
+            del _db_content[table][ref]
 
     def _async(self, name, params):
         task_ref = create_task(name)
@@ -739,7 +791,7 @@ class SessionBase(object):
         except Failure, exc:
             task['error_info'] = exc.details
             task['status'] = 'failed'
-        task['finished'] = utils.utcnow()
+        task['finished'] = timeutils.utcnow()
         return task_ref
 
     def _check_session(self, params):

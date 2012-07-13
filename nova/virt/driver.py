@@ -24,7 +24,7 @@ Driver base-classes:
 
 from nova.compute import power_state
 from nova import flags
-from nova import log as logging
+from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -545,6 +545,11 @@ class ComputeDriver(object):
 
     def set_host_enabled(self, host, enabled):
         """Sets the specified host's ability to accept new instances."""
+        # TODO(Vek): Need to pass context in for access to auth_token
+        raise NotImplementedError()
+
+    def get_host_uptime(self, host):
+        """Returns the result of calling "uptime" on the target host."""
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 

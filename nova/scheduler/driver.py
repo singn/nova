@@ -24,16 +24,17 @@ Scheduler base class that all Schedulers should inherit from
 from nova.compute import api as compute_api
 from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
-from nova.compute import vm_states
+from nova.compute import task_states
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova import notifications
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
-from nova import rpc
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
+from nova.openstack.common import timeutils
 from nova import utils
 
 
@@ -49,7 +50,7 @@ FLAGS = flags.FLAGS
 FLAGS.register_opts(scheduler_driver_opts)
 
 flags.DECLARE('instances_path', 'nova.compute.manager')
-flags.DECLARE('libvirt_type', 'nova.virt.libvirt.connection')
+flags.DECLARE('libvirt_type', 'nova.virt.libvirt.driver')
 
 
 def cast_to_volume_host(context, host, method, update_db=True, **kwargs):
@@ -58,7 +59,7 @@ def cast_to_volume_host(context, host, method, update_db=True, **kwargs):
     if update_db:
         volume_id = kwargs.get('volume_id', None)
         if volume_id is not None:
-            now = utils.utcnow()
+            now = timeutils.utcnow()
             db.volume_update(context, volume_id,
                     {'host': host, 'scheduled_at': now})
     rpc.cast(context,
@@ -75,7 +76,7 @@ def cast_to_compute_host(context, host, method, update_db=True, **kwargs):
         instance_id = kwargs.get('instance_id', None)
         instance_uuid = kwargs.get('instance_uuid', instance_id)
         if instance_uuid is not None:
-            now = utils.utcnow()
+            now = timeutils.utcnow()
             db.instance_update(context, instance_uuid,
                     {'host': host, 'scheduled_at': now})
     rpc.cast(context,
@@ -227,7 +228,7 @@ class Scheduler(object):
                                           disk_over_commit)
 
         # Changing instance_state.
-        values = {"vm_state": vm_states.MIGRATING}
+        values = {"task_state": task_states.MIGRATING}
 
         # update instance state and notify
         (old_ref, new_instance_ref) = db.instance_update_and_get_original(

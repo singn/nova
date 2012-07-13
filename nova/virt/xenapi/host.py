@@ -21,6 +21,7 @@ Management class for host-related functions (start, reboot, etc).
 
 import logging
 
+from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
 from nova import db
@@ -37,7 +38,6 @@ class Host(object):
     Implements host related operations.
     """
     def __init__(self, session):
-        self.XenAPI = session.get_imported_xenapi()
         self._session = session
 
     def host_power_action(self, _host, action):
@@ -80,7 +80,7 @@ class Host(object):
                                     ctxt,
                                     instance.id,
                                     {'host': dest,
-                                     'vm_state': vm_states.MIGRATING})
+                                     'task_state': task_states.MIGRATING})
                     notifications.send_update(ctxt, old_ref, new_ref)
 
                     self._session.call_xenapi('VM.pool_migrate',
@@ -94,7 +94,7 @@ class Host(object):
                     notifications.send_update(ctxt, old_ref, new_ref)
 
                     break
-                except self.XenAPI.Failure:
+                except self._session.XenAPI.Failure:
                     LOG.exception('Unable to migrate VM %(vm_ref)s'
                                   'from %(host)s' % locals())
                     (old_ref, new_ref) = db.instance_update_and_get_original(
@@ -115,6 +115,11 @@ class Host(object):
         args = {"enabled": jsonutils.dumps(enabled)}
         response = call_xenhost(self._session, "set_host_enabled", args)
         return response.get("status", response)
+
+    def get_host_uptime(self, _host):
+        """Returns the result of calling "uptime" on the target host."""
+        response = call_xenhost(self._session, "host_uptime", {})
+        return response.get("uptime", response)
 
 
 class HostState(object):
@@ -172,7 +177,6 @@ def call_xenhost(session, method, arg_dict):
     out that behavior.
     """
     # Create a task ID as something that won't match any instance ID
-    XenAPI = session.get_imported_xenapi()
     try:
         result = session.call_plugin('xenhost', method, args=arg_dict)
         if not result:
@@ -181,7 +185,7 @@ def call_xenhost(session, method, arg_dict):
     except ValueError:
         LOG.exception(_("Unable to get updated status"))
         return None
-    except XenAPI.Failure as e:
+    except session.XenAPI.Failure as e:
         LOG.error(_("The call to %(method)s returned "
                     "an error: %(e)s.") % locals())
         return e.details[1]

@@ -26,10 +26,10 @@ import time
 
 from nova import test
 
-from nova.compute import task_states
+from nova.compute import vm_states
 from nova import db
 from nova import flags
-from nova import log
+from nova.openstack.common import log
 from nova import utils
 from nova.virt.libvirt import imagecache
 from nova.virt.libvirt import utils as virtutils
@@ -150,16 +150,19 @@ class ImageCacheManagerTestCase(test.TestCase):
                                    'host': FLAGS.host,
                                    'name': 'inst-1',
                                    'uuid': '123',
+                                   'vm_state': '',
                                    'task_state': ''},
                                   {'image_ref': '2',
                                    'host': FLAGS.host,
                                    'name': 'inst-2',
                                    'uuid': '456',
+                                   'vm_state': '',
                                    'task_state': ''},
                                   {'image_ref': '2',
                                    'host': 'remotehost',
                                    'name': 'inst-3',
                                    'uuid': '789',
+                                   'vm_state': '',
                                    'task_state': ''}])
 
         image_cache_manager = imagecache.ImageCacheManager()
@@ -183,7 +186,8 @@ class ImageCacheManagerTestCase(test.TestCase):
                                    'host': FLAGS.host,
                                    'name': 'inst-1',
                                    'uuid': '123',
-                                   'task_state': task_states.RESIZE_VERIFY}])
+                                   'vm_state': vm_states.RESIZED,
+                                   'task_state': None}])
 
         image_cache_manager = imagecache.ImageCacheManager()
         image_cache_manager._list_running_instances(None)
@@ -331,10 +335,10 @@ class ImageCacheManagerTestCase(test.TestCase):
     @contextlib.contextmanager
     def _intercept_log_messages(self):
         try:
-            mylog = log.getLogger()
+            mylog = log.getLogger('nova')
             stream = cStringIO.StringIO()
             handler = logging.StreamHandler(stream)
-            handler.setFormatter(log.LegacyNovaFormatter())
+            handler.setFormatter(log.LegacyFormatter())
             mylog.logger.addHandler(handler)
             yield stream
         finally:
@@ -425,7 +429,7 @@ class ImageCacheManagerTestCase(test.TestCase):
             image_cache_manager = imagecache.ImageCacheManager()
             res = image_cache_manager._verify_checksum(
                 img, fname, create_if_missing=True)
-            self.assertTrue(res == None)
+            self.assertTrue(res is None)
 
     def test_verify_checksum_invalid(self):
         img = {'container_format': 'ami', 'id': '42'}
@@ -766,11 +770,13 @@ class ImageCacheManagerTestCase(test.TestCase):
                                    'host': FLAGS.host,
                                    'name': 'instance-1',
                                    'uuid': '123',
+                                   'vm_state': '',
                                    'task_state': ''},
                                   {'image_ref': '1',
                                    'host': FLAGS.host,
                                    'name': 'instance-2',
                                    'uuid': '456',
+                                   'vm_state': '',
                                    'task_state': ''}])
 
         image_cache_manager = imagecache.ImageCacheManager()
@@ -865,11 +871,13 @@ class ImageCacheManagerTestCase(test.TestCase):
                                        'host': FLAGS.host,
                                        'name': 'instance-1',
                                        'uuid': '123',
+                                       'vm_state': '',
                                        'task_state': ''},
                                       {'image_ref': '1',
                                        'host': FLAGS.host,
                                        'name': 'instance-2',
                                        'uuid': '456',
+                                       'vm_state': '',
                                        'task_state': ''}])
 
             def touch(filename):

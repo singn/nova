@@ -124,6 +124,19 @@ class HostFiltersTestCase(test.TestCase):
 
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
+    def test_affinity_different_filter_no_list_passes(self):
+        filt_cls = self.class_map['DifferentHostFilter']()
+        host = fakes.FakeHostState('host1', 'compute', {})
+        instance = fakes.FakeInstance(context=self.context,
+                                         params={'host': 'host2'})
+        instance_uuid = instance.uuid
+
+        filter_properties = {'context': self.context.elevated(),
+                             'scheduler_hints': {
+                                 'different_host': instance_uuid}}
+
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
     def test_affinity_different_filter_fails(self):
         filt_cls = self.class_map['DifferentHostFilter']()
         host = fakes.FakeHostState('host1', 'compute', {})
@@ -146,6 +159,19 @@ class HostFiltersTestCase(test.TestCase):
 
         filter_properties = {'context': self.context.elevated(),
                              'scheduler_hints': None}
+
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_affinity_same_filter_no_list_passes(self):
+        filt_cls = self.class_map['SameHostFilter']()
+        host = fakes.FakeHostState('host1', 'compute', {})
+        instance = fakes.FakeInstance(context=self.context,
+                                         params={'host': 'host1'})
+        instance_uuid = instance.uuid
+
+        filter_properties = {'context': self.context.elevated(),
+                             'scheduler_hints': {
+                                 'same_host': instance_uuid}}
 
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
@@ -274,9 +300,21 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True}
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'compute',
-                {'free_ram_mb': 1023, 'capabilities': capabilities,
-                 'service': service})
+                {'free_ram_mb': 1023, 'total_usable_ram_mb': 1024,
+                 'capabilities': capabilities, 'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_ram_filter_oversubscribe(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['RamFilter']()
+        self.flags(ram_allocation_ratio=2.0)
+        filter_properties = {'instance_type': {'memory_mb': 1024}}
+        capabilities = {'enabled': True}
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'compute',
+                {'free_ram_mb': -1024, 'total_usable_ram_mb': 2048,
+                 'capabilities': capabilities, 'service': service})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_compute_filter_fails_on_service_disabled(self):
         self._stub_service_is_up(True)
@@ -793,3 +831,57 @@ class HostFiltersTestCase(test.TestCase):
         request = self._make_zone_request('bad')
         host = fakes.FakeHostState('host1', 'compute', {'service': service})
         self.assertFalse(filt_cls.host_passes(host, request))
+
+    def test_arch_filter_same(self):
+        permitted_instances = ['x86_64']
+        filt_cls = self.class_map['ArchFilter']()
+        filter_properties = {
+            'request_spec': {
+                'instance_properties': {'architecture': 'x86_64'}
+            }
+        }
+        capabilities = {'enabled': True,
+                            'cpu_info': {
+                                'permitted_instance_types': permitted_instances
+                            }
+                        }
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'compute',
+            {'capabilities': capabilities, 'service': service})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_arch_filter_different(self):
+        permitted_instances = ['arm']
+        filt_cls = self.class_map['ArchFilter']()
+        filter_properties = {
+            'request_spec': {
+                    'instance_properties': {'architecture': 'x86_64'}
+                }
+            }
+        capabilities = {'enabled': True,
+                            'cpu_info': {
+                                'permitted_instance_types': permitted_instances
+                            }
+                        }
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'compute',
+            {'capabilities': capabilities, 'service': service})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_arch_filter_without_permitted_instances(self):
+        permitted_instances = []
+        filt_cls = self.class_map['ArchFilter']()
+        filter_properties = {
+             'request_spec': {
+                'instance_properties': {'architecture': 'x86_64'}
+            }
+        }
+        capabilities = {'enabled': True,
+                            'cpu_info': {
+                                'permitted_instance_types': permitted_instances
+                            }
+                        }
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'compute',
+            {'capabilities': capabilities, 'service': service})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))

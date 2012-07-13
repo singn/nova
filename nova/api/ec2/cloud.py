@@ -25,7 +25,6 @@ datastore.
 import base64
 import re
 import time
-import urllib
 
 from nova.api.ec2 import ec2utils
 from nova.api.ec2 import inst_state
@@ -38,10 +37,10 @@ from nova import db
 from nova import exception
 from nova import flags
 from nova.image import s3
-from nova import log as logging
 from nova import network
 from nova.openstack.common import excutils
-from nova.openstack.common import importutils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import quota
 from nova import utils
 from nova import volume
@@ -72,26 +71,22 @@ _STATE_DESCRIPTION_MAP = {
     None: inst_state.PENDING,
     vm_states.ACTIVE: inst_state.RUNNING,
     vm_states.BUILDING: inst_state.PENDING,
-    vm_states.REBUILDING: inst_state.PENDING,
     vm_states.DELETED: inst_state.TERMINATED,
-    vm_states.SOFT_DELETE: inst_state.TERMINATED,
+    vm_states.SOFT_DELETED: inst_state.TERMINATED,
     vm_states.STOPPED: inst_state.STOPPED,
-    vm_states.SHUTOFF: inst_state.SHUTOFF,
-    vm_states.MIGRATING: inst_state.MIGRATE,
-    vm_states.RESIZING: inst_state.RESIZE,
     vm_states.PAUSED: inst_state.PAUSE,
     vm_states.SUSPENDED: inst_state.SUSPEND,
     vm_states.RESCUED: inst_state.RESCUE,
+    vm_states.RESIZED: inst_state.RESIZE,
 }
 
 
-def _state_description(vm_state, shutdown_terminate):
+def _state_description(vm_state, _shutdown_terminate):
     """Map the vm state to the server status string"""
-    if (vm_state == vm_states.SHUTOFF and
-        not shutdown_terminate):
-            name = inst_state.STOPPED
-    else:
-        name = _STATE_DESCRIPTION_MAP.get(vm_state, vm_state)
+    # Note(maoy): We do not provide EC2 compatibility
+    # in shutdown_terminate flag behavior. So we ignore
+    # it here.
+    name = _STATE_DESCRIPTION_MAP.get(vm_state, vm_state)
 
     return {'code': inst_state.name_to_code(name),
             'name': name}
@@ -190,10 +185,11 @@ class CloudController(object):
         self.image_service = s3.S3ImageService()
         self.network_api = network.API()
         self.volume_api = volume.API()
+        self.security_group_api = CloudSecurityGroupAPI()
         self.compute_api = compute.API(network_api=self.network_api,
-                                       volume_api=self.volume_api)
+                                   volume_api=self.volume_api,
+                                   security_group_api=self.security_group_api)
         self.keypair_api = compute.api.KeypairAPI()
-        self.sgh = importutils.import_object(FLAGS.security_group_handler)
 
     def __str__(self):
         return 'CloudController'
@@ -319,11 +315,13 @@ class CloudController(object):
                   context=context)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
         volume = self.volume_api.get(context, volume_id)
-        snapshot = self.volume_api.create_snapshot(
-                context,
-                volume,
-                None,
-                kwargs.get('description'))
+        args = (context, volume, kwargs.get('name'), kwargs.get('description'))
+        if kwargs.get('force', False):
+            snapshot = self.volume_api.create_snapshot_force(*args)
+        else:
+            snapshot = self.volume_api.create_snapshot(*args)
+
+        db.ec2_snapshot_create(context, snapshot['id'])
         return self._format_snapshot(context, snapshot)
 
     def delete_snapshot(self, context, snapshot_id, **kwargs):
@@ -338,7 +336,7 @@ class CloudController(object):
             key_pairs = [x for x in key_pairs if x['name'] in key_name]
 
         #If looking for non existent key pair
-        if key_name != None and key_pairs == []:
+        if key_name is not None and not key_pairs:
             msg = _('Could not find key pair(s): %s') % ','.join(key_name)
             raise exception.EC2APIError(msg)
 
@@ -411,25 +409,12 @@ class CloudController(object):
 
     def describe_security_groups(self, context, group_name=None, group_id=None,
                                  **kwargs):
-        self.compute_api.ensure_default_security_group(context)
-        if group_name or group_id:
-            groups = []
-            if group_name:
-                for name in group_name:
-                    group = db.security_group_get_by_name(context,
-                                                          context.project_id,
-                                                          name)
-                    groups.append(group)
-            if group_id:
-                for gid in group_id:
-                    group = db.security_group_get(context, gid)
-                    groups.append(group)
-        elif context.is_admin:
-            groups = db.security_group_get_all(context)
-        else:
-            groups = db.security_group_get_by_project(context,
-                                                      context.project_id)
-        groups = [self._format_security_group(context, g) for g in groups]
+        raw_groups = self.security_group_api.list(context,
+                                                  group_name,
+                                                  group_id,
+                                                  context.project_id)
+
+        groups = [self._format_security_group(context, g) for g in raw_groups]
 
         return {'securityGroupInfo':
                 list(sorted(groups,
@@ -536,146 +521,51 @@ class CloudController(object):
             notfound = exception.SecurityGroupNotFound
             if not source_security_group:
                 raise notfound(security_group_id=source_security_group_name)
-            values['group_id'] = source_security_group['id']
-        elif cidr_ip:
-            # If this fails, it throws an exception. This is what we want.
-            cidr_ip = urllib.unquote(cidr_ip).decode()
-
-            if not utils.is_valid_cidr(cidr_ip):
-                # Raise exception for non-valid address
-                raise exception.EC2APIError(_("Invalid CIDR"))
-
-            values['cidr'] = cidr_ip
+            group_id = source_security_group['id']
+            return self.security_group_api.new_group_ingress_rule(
+                                    group_id, ip_protocol, from_port, to_port)
         else:
-            values['cidr'] = '0.0.0.0/0'
+            cidr = self.security_group_api.parse_cidr(cidr_ip)
+            return self.security_group_api.new_cidr_ingress_rule(
+                                        cidr, ip_protocol, from_port, to_port)
 
-        if source_security_group_name:
-            # Open everything if an explicit port range or type/code are not
-            # specified, but only if a source group was specified.
-            ip_proto_upper = ip_protocol.upper() if ip_protocol else ''
-            if (ip_proto_upper == 'ICMP' and
-                from_port is None and to_port is None):
-                from_port = -1
-                to_port = -1
-            elif (ip_proto_upper in ['TCP', 'UDP'] and from_port is None
-                  and to_port is None):
-                from_port = 1
-                to_port = 65535
-
-        if ip_protocol and from_port is not None and to_port is not None:
-
-            ip_protocol = str(ip_protocol)
-            try:
-                # Verify integer conversions
-                from_port = int(from_port)
-                to_port = int(to_port)
-            except ValueError:
-                if ip_protocol.upper() == 'ICMP':
-                    raise exception.InvalidInput(reason="Type and"
-                         " Code must be integers for ICMP protocol type")
-                else:
-                    raise exception.InvalidInput(reason="To and From ports "
-                          "must be integers")
-
-            if ip_protocol.upper() not in ['TCP', 'UDP', 'ICMP']:
-                raise exception.InvalidIpProtocol(protocol=ip_protocol)
-
-            # Verify that from_port must always be less than
-            # or equal to to_port
-            if (ip_protocol.upper() in ['TCP', 'UDP'] and
-                (from_port > to_port)):
-                raise exception.InvalidPortRange(from_port=from_port,
-                      to_port=to_port, msg="Former value cannot"
-                                            " be greater than the later")
-
-            # Verify valid TCP, UDP port ranges
-            if (ip_protocol.upper() in ['TCP', 'UDP'] and
-                (from_port < 1 or to_port > 65535)):
-                raise exception.InvalidPortRange(from_port=from_port,
-                      to_port=to_port, msg="Valid TCP ports should"
-                                           " be between 1-65535")
-
-            # Verify ICMP type and code
-            if (ip_protocol.upper() == "ICMP" and
-                (from_port < -1 or from_port > 255 or
-                to_port < -1 or to_port > 255)):
-                raise exception.InvalidPortRange(from_port=from_port,
-                      to_port=to_port, msg="For ICMP, the"
-                                           " type:code must be valid")
-
-            values['protocol'] = ip_protocol.lower()
-            values['from_port'] = from_port
-            values['to_port'] = to_port
-        else:
-            # If cidr based filtering, protocol and ports are mandatory
-            if 'cidr' in values:
-                return None
-
-        return values
-
-    def _security_group_rule_exists(self, security_group, values):
-        """Indicates whether the specified rule values are already
-           defined in the given security group.
-        """
-        for rule in security_group.rules:
-            is_duplicate = True
-            keys = ('group_id', 'cidr', 'from_port', 'to_port', 'protocol')
-            for key in keys:
-                if rule.get(key) != values.get(key):
-                    is_duplicate = False
-                    break
-            if is_duplicate:
-                return rule['id']
-        return False
-
-    def revoke_security_group_ingress(self, context, group_name=None,
-                                      group_id=None, **kwargs):
+    def _validate_group_identifier(self, group_name, group_id):
         if not group_name and not group_id:
             err = _("Not enough parameters, need group_name or group_id")
             raise exception.EC2APIError(err)
-        self.compute_api.ensure_default_security_group(context)
-        notfound = exception.SecurityGroupNotFound
-        if group_name:
-            security_group = db.security_group_get_by_name(context,
-                                                           context.project_id,
-                                                           group_name)
-            if not security_group:
-                raise notfound(security_group_id=group_name)
-        if group_id:
-            security_group = db.security_group_get(context, group_id)
-            if not security_group:
-                raise notfound(security_group_id=group_id)
 
-        msg = _("Revoke security group ingress %s")
-        LOG.audit(msg, security_group['name'], context=context)
-        prevalues = []
-        try:
-            prevalues = kwargs['ip_permissions']
-        except KeyError:
-            prevalues.append(kwargs)
-        rule_id = None
+    def _validate_rulevalues(self, rulesvalues):
+        if not rulesvalues:
+            err = _("%s Not enough parameters to build a valid rule")
+            raise exception.EC2APIError(err % rulesvalues)
+
+    def revoke_security_group_ingress(self, context, group_name=None,
+                                      group_id=None, **kwargs):
+        self._validate_group_identifier(group_name, group_id)
+
+        security_group = self.security_group_api.get(context, group_name,
+                                                     group_id)
+
+        prevalues = kwargs.get('ip_permissions', [kwargs])
+
         rule_ids = []
         for values in prevalues:
             rulesvalues = self._rule_args_to_dict(context, values)
-            if not rulesvalues:
-                err = _("%s Not enough parameters to build a valid rule")
-                raise exception.EC2APIError(err % rulesvalues)
-
+            self._validate_rulevalues(rulesvalues)
             for values_for_rule in rulesvalues:
                 values_for_rule['parent_group_id'] = security_group.id
-                rule_id = self._security_group_rule_exists(security_group,
-                                                           values_for_rule)
-                if rule_id:
-                    db.security_group_rule_destroy(context, rule_id)
-                    rule_ids.append(rule_id)
-        if rule_id:
-            # NOTE(vish): we removed a rule, so refresh
-            self.compute_api.trigger_security_group_rules_refresh(
-                    context,
-                    security_group_id=security_group['id'])
-            self.sgh.trigger_security_group_rule_destroy_refresh(
-                    context, rule_ids)
+
+                rule_ids.append(self.security_group_api.rule_exists(
+                                             security_group, values_for_rule))
+
+        rule_ids = [id for id in rule_ids if id]
+
+        if rule_ids:
+            self.security_group_api.remove_rules(context, security_group,
+                                                 rule_ids)
+
             return True
+
         raise exception.EC2APIError(_("No rule for the specified parameters."))
 
     # TODO(soren): This has only been tested with Boto as the client.
@@ -684,64 +574,27 @@ class CloudController(object):
     #              is sketchy.
     def authorize_security_group_ingress(self, context, group_name=None,
                                          group_id=None, **kwargs):
-        if not group_name and not group_id:
-            err = _("Not enough parameters, need group_name or group_id")
-            raise exception.EC2APIError(err)
-        self.compute_api.ensure_default_security_group(context)
-        notfound = exception.SecurityGroupNotFound
-        if group_name:
-            security_group = db.security_group_get_by_name(context,
-                                                           context.project_id,
-                                                           group_name)
-            if not security_group:
-                raise notfound(security_group_id=group_name)
-        if group_id:
-            security_group = db.security_group_get(context, group_id)
-            if not security_group:
-                raise notfound(security_group_id=group_id)
+        self._validate_group_identifier(group_name, group_id)
 
-        msg = _("Authorize security group ingress %s")
-        LOG.audit(msg, security_group['name'], context=context)
-        prevalues = []
-        try:
-            prevalues = kwargs['ip_permissions']
-        except KeyError:
-            prevalues.append(kwargs)
+        security_group = self.security_group_api.get(context, group_name,
+                                                     group_id)
+
+        prevalues = kwargs.get('ip_permissions', [kwargs])
         postvalues = []
         for values in prevalues:
             rulesvalues = self._rule_args_to_dict(context, values)
-            if not rulesvalues:
-                err = _("%s Not enough parameters to build a valid rule")
-                raise exception.EC2APIError(err % rulesvalues)
+            self._validate_rulevalues(rulesvalues)
             for values_for_rule in rulesvalues:
                 values_for_rule['parent_group_id'] = security_group.id
-                if self._security_group_rule_exists(security_group,
-                                                    values_for_rule):
+                if self.security_group_api.rule_exists(security_group,
+                                                       values_for_rule):
                     err = _('%s - This rule already exists in group')
                     raise exception.EC2APIError(err % values_for_rule)
                 postvalues.append(values_for_rule)
 
-        count = QUOTAS.count(context, 'security_group_rules',
-                             security_group['id'])
-        try:
-            QUOTAS.limit_check(context, security_group_rules=count + 1)
-        except exception.OverQuota:
-            msg = _("Quota exceeded, too many security group rules.")
-            raise exception.EC2APIError(msg)
-
-        rule_ids = []
-        for values_for_rule in postvalues:
-            security_group_rule = db.security_group_rule_create(
-                    context,
-                    values_for_rule)
-            rule_ids.append(security_group_rule['id'])
-
         if postvalues:
-            self.compute_api.trigger_security_group_rules_refresh(
-                    context,
-                    security_group_id=security_group['id'])
-            self.sgh.trigger_security_group_rule_create_refresh(
-                    context, rule_ids)
+            self.security_group_api.add_rules(context, security_group['id'],
+                                           security_group['name'], postvalues)
             return True
 
         raise exception.EC2APIError(_("No rule for the specified parameters."))
@@ -766,64 +619,23 @@ class CloudController(object):
     def create_security_group(self, context, group_name, group_description):
         if isinstance(group_name, unicode):
             group_name = group_name.encode('utf-8')
-        # TODO(Daviey): LP: #813685 extend beyond group_name checking, and
-        # probably create a param validator that can be used elsewhere.
         if FLAGS.ec2_strict_validation:
             # EC2 specification gives constraints for name and description:
             # Accepts alphanumeric characters, spaces, dashes, and underscores
-            err = _("Value (%(value)s) for parameter %(param)s is invalid."
-                    " Content limited to Alphanumeric characters,"
-                    " spaces, dashes, and underscores.")
-            if not re.match('^[a-zA-Z0-9_\- ]+$', group_name):
-                raise exception.InvalidParameterValue(
-                    err=err % {"value": group_name,
-                               "param": "GroupName"})
-            if not re.match('^[a-zA-Z0-9_\- ]+$', group_description):
-                raise exception.InvalidParameterValue(
-                    err=err % {"value": group_description,
-                               "param": "GroupDescription"})
+            allowed = '^[a-zA-Z0-9_\- ]+$'
+            self.security_group_api.validate_property(group_name, 'name',
+                                                      allowed)
+            self.security_group_api.validate_property(group_description,
+                                                      'description', allowed)
         else:
             # Amazon accepts more symbols.
             # So, allow POSIX [:print:] characters.
-            if not re.match(r'^[\x20-\x7E]+$', group_name):
-                err = _("Value (%(value)s) for parameter %(param)s is invalid."
-                        " Content is limited to characters"
-                        " from the [:print:] class.")
-                raise exception.InvalidParameterValue(
-                    err=err % {"value": group_name,
-                               "param": "GroupName"})
+            allowed = r'^[\x20-\x7E]+$'
+            self.security_group_api.validate_property(group_name, 'name',
+                                                      allowed)
 
-        if len(group_name) > 255:
-            err = _("Value (%s) for parameter GroupName is invalid."
-                    " Length exceeds maximum of 255.") % group_name
-            raise exception.InvalidParameterValue(err=err)
-
-        LOG.audit(_("Create Security Group %s"), group_name, context=context)
-        self.compute_api.ensure_default_security_group(context)
-        if db.security_group_exists(context, context.project_id, group_name):
-            msg = _('group %s already exists')
-            raise exception.EC2APIError(msg % group_name)
-
-        try:
-            reservations = QUOTAS.reserve(context, security_groups=1)
-        except exception.OverQuota:
-            msg = _("Quota exceeded, too many security groups.")
-            raise exception.EC2APIError(msg)
-
-        try:
-            group = {'user_id': context.user_id,
-                     'project_id': context.project_id,
-                     'name': group_name,
-                     'description': group_description}
-            group_ref = db.security_group_create(context, group)
-
-            self.sgh.trigger_security_group_create_refresh(context, group)
-
-            # Commit the reservation
-            QUOTAS.commit(context, reservations)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                QUOTAS.rollback(context, reservations)
+        group_ref = self.security_group_api.create(context, group_name,
+                                                   group_description)
 
         return {'securityGroupSet': [self._format_security_group(context,
                                                                  group_ref)]}
@@ -833,37 +645,11 @@ class CloudController(object):
         if not group_name and not group_id:
             err = _("Not enough parameters, need group_name or group_id")
             raise exception.EC2APIError(err)
-        notfound = exception.SecurityGroupNotFound
-        if group_name:
-            security_group = db.security_group_get_by_name(context,
-                                                           context.project_id,
-                                                           group_name)
-            if not security_group:
-                raise notfound(security_group_id=group_name)
-        elif group_id:
-            security_group = db.security_group_get(context, group_id)
-            if not security_group:
-                raise notfound(security_group_id=group_id)
-        if db.security_group_in_use(context, security_group.id):
-            raise exception.InvalidGroup(reason="In Use")
 
-        # Get reservations
-        try:
-            reservations = QUOTAS.reserve(context, security_groups=-1)
-        except Exception:
-            reservations = None
-            LOG.exception(_("Failed to update usages deallocating "
-                            "security group"))
+        security_group = self.security_group_api.get(context, group_name,
+                                                     group_id)
 
-        LOG.audit(_("Delete security group %s"), group_name, context=context)
-        db.security_group_destroy(context, security_group.id)
-
-        self.sgh.trigger_security_group_destroy_refresh(context,
-                                                        security_group.id)
-
-        # Commit the reservations
-        if reservations:
-            QUOTAS.commit(context, reservations)
+        self.security_group_api.destroy(context, security_group)
 
         return True
 
@@ -879,7 +665,7 @@ class CloudController(object):
         instance_id = ec2utils.ec2_id_to_id(ec2_id)
         instance = self.compute_api.get(context, instance_id)
         output = self.compute_api.get_console_output(context, instance)
-        now = utils.utcnow()
+        now = timeutils.utcnow()
         return {"InstanceId": ec2_id,
                 "Timestamp": now,
                 "output": base64.b64encode(output)}
@@ -906,8 +692,7 @@ class CloudController(object):
             instance = db.instance_get_by_uuid(context.elevated(),
                     instance_uuid)
 
-            instance_id = instance['id']
-            instance_ec2_id = ec2utils.id_to_ec2_id(instance_id)
+            instance_ec2_id = ec2utils.id_to_ec2_inst_id(instance_uuid)
             instance_data = '%s[%s]' % (instance_ec2_id,
                                         instance['host'])
         v = {}
@@ -940,24 +725,28 @@ class CloudController(object):
         return v
 
     def create_volume(self, context, **kwargs):
-        size = kwargs.get('size')
-        if kwargs.get('snapshot_id') is not None:
+        snapshot_ec2id = kwargs.get('snapshot_id', None)
+        if snapshot_ec2id is not None:
             snapshot_id = ec2utils.ec2_snap_id_to_uuid(kwargs['snapshot_id'])
             snapshot = self.volume_api.get_snapshot(context, snapshot_id)
-            LOG.audit(_("Create volume from snapshot %s"), snapshot_id,
+            LOG.audit(_("Create volume from snapshot %s"), snapshot_ec2id,
                       context=context)
         else:
             snapshot = None
-            LOG.audit(_("Create volume of %s GB"), size, context=context)
-
-        availability_zone = kwargs.get('availability_zone', None)
+            LOG.audit(_("Create volume of %s GB"),
+                        kwargs.get('size'),
+                        context=context)
 
         volume = self.volume_api.create(context,
-                                        size,
-                                        None,
-                                        None,
+                                        kwargs.get('size'),
+                                        kwargs.get('name'),
+                                        kwargs.get('description'),
                                         snapshot,
-                                        availability_zone=availability_zone)
+                                        kwargs.get('volume_type'),
+                                        kwargs.get('metadata'),
+                                        kwargs.get('availability_zone'))
+
+        db.ec2_volume_create(context, volume['id'])
         # TODO(vish): Instance should be None at db layer instead of
         #             trying to lazy load, but for now we turn it into
         #             a dict to avoid an error.
@@ -966,7 +755,6 @@ class CloudController(object):
     def delete_volume(self, context, volume_id, **kwargs):
         validate_ec2_id(volume_id)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
-
         try:
             volume = self.volume_api.get(context, volume_id)
             self.volume_api.delete(context, volume)
@@ -975,7 +763,10 @@ class CloudController(object):
 
         return True
 
-    def attach_volume(self, context, volume_id, instance_id, device, **kwargs):
+    def attach_volume(self, context,
+                      volume_id,
+                      instance_id,
+                      device, **kwargs):
         validate_ec2_id(instance_id)
         validate_ec2_id(volume_id)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
@@ -994,7 +785,7 @@ class CloudController(object):
         volume = self.volume_api.get(context, volume_id)
         return {'attachTime': volume['attach_time'],
                 'device': volume['mountpoint'],
-                'instanceId': ec2utils.id_to_ec2_id(instance_id),
+                'instanceId': ec2utils.id_to_ec2_inst_id(instance_id),
                 'requestId': context.request_id,
                 'status': volume['attach_status'],
                 'volumeId': ec2utils.id_to_ec2_vol_id(volume_id)}
@@ -1013,7 +804,7 @@ class CloudController(object):
 
         return {'attachTime': volume['attach_time'],
                 'device': volume['mountpoint'],
-                'instanceId': ec2utils.id_to_ec2_id(instance['id']),
+                'instanceId': ec2utils.id_to_ec2_inst_id(instance['uuid']),
                 'requestId': context.request_id,
                 'status': volume['attach_status'],
                 'volumeId': ec2utils.id_to_ec2_vol_id(volume_id)}
@@ -1203,9 +994,10 @@ class CloudController(object):
         if instance_id:
             instances = []
             for ec2_id in instance_id:
-                internal_id = ec2utils.ec2_id_to_id(ec2_id)
                 try:
-                    instance = self.compute_api.get(context, internal_id)
+                    instance_uuid = ec2utils.ec2_inst_id_to_uuid(context,
+                                                                 ec2_id)
+                    instance = self.compute_api.get(context, instance_uuid)
                 except exception.NotFound:
                     continue
                 instances.append(instance)
@@ -1223,8 +1015,8 @@ class CloudController(object):
                 if instance['image_ref'] == str(FLAGS.vpn_image_id):
                     continue
             i = {}
-            instance_id = instance['id']
-            ec2_id = ec2utils.id_to_ec2_id(instance_id)
+            instance_uuid = instance['uuid']
+            ec2_id = ec2utils.id_to_ec2_inst_id(instance_uuid)
             i['instanceId'] = ec2_id
             image_uuid = instance['image_ref']
             i['imageId'] = ec2utils.glance_id_to_ec2_id(context, image_uuid)
@@ -1297,7 +1089,7 @@ class CloudController(object):
             fixed_id = floating_ip['fixed_ip_id']
             fixed = self.network_api.get_fixed_ip(context, fixed_id)
             if fixed['instance_id'] is not None:
-                ec2_id = ec2utils.id_to_ec2_id(fixed['instance_id'])
+                ec2_id = ec2utils.id_to_ec2_inst_id(fixed['instance_id'])
         address = {'public_ip': floating_ip['address'],
                    'instance_id': ec2_id}
         if context.is_admin:
@@ -1324,17 +1116,49 @@ class CloudController(object):
                 " instance %(instance_id)s") % locals(), context=context)
         instance_id = ec2utils.ec2_id_to_id(instance_id)
         instance = self.compute_api.get(context, instance_id)
+
+        cached_ipinfo = ec2utils.get_ip_info_for_instance(context, instance)
+        fixed_ips = cached_ipinfo['fixed_ips'] + cached_ipinfo['fixed_ip6s']
+        if not fixed_ips:
+            msg = _('Unable to associate IP Address, no fixed_ips.')
+            raise exception.EC2APIError(msg)
+
+        # TODO(tr3buchet): this will associate the floating IP with the
+        # first fixed_ip an instance has. This should be
+        # changed to support specifying a particular fixed_ip if
+        # multiple exist but this may not apply to ec2..
+        if len(fixed_ips) > 1:
+            msg = _('multiple fixed_ips exist, using the first: %s')
+            LOG.warning(msg, fixed_ips[0])
+
         try:
-            self.compute_api.associate_floating_ip(context,
-                                                   instance,
-                                                   address=public_ip)
-            return {'return': "true"}
-        except exception.FloatingIpNotFound:
-            raise exception.EC2APIError(_('Unable to associate IP Address.'))
+            self.network_api.associate_floating_ip(context, instance,
+                                  floating_address=public_ip,
+                                  fixed_address=fixed_ips[0])
+            return {'return': 'true'}
+        except exception.FloatingIpAssociated:
+            msg = _('Floating ip is already associated.')
+            raise exception.EC2APIError(msg)
+        except exception.NoFloatingIpInterface:
+            msg = _('l3driver call to add floating ip failed.')
+            raise exception.EC2APIError(msg)
+        except Exception:
+            msg = _('Error, unable to associate floating ip.')
+            LOG.exception(msg)
+            raise exception.EC2APIError(msg)
 
     def disassociate_address(self, context, public_ip, **kwargs):
+        instance_id = self.network_api.get_instance_id_by_floating_address(
+                                                         context, public_ip)
+        instance = self.compute_api.get(context, instance_id)
         LOG.audit(_("Disassociate address %s"), public_ip, context=context)
-        self.network_api.disassociate_floating_ip(context, address=public_ip)
+        try:
+            self.network_api.disassociate_floating_ip(context, instance,
+                                                      address=public_ip)
+        except exception.FloatingIpNotAssociated:
+            msg = _('Floating ip is not associated.')
+            raise exception.EC2APIError(msg)
+
         return {'return': "true"}
 
     def run_instances(self, context, **kwargs):
@@ -1429,9 +1253,11 @@ class CloudController(object):
             internal_id = ec2utils.ec2_id_to_id(ec2_id)
             image = self.image_service.show(context, internal_id)
         except (exception.InvalidEc2Id, exception.ImageNotFound):
+            filters = {'name': ec2_id}
+            images = self.image_service.detail(context, filters=filters)
             try:
-                return self.image_service.show_by_name(context, ec2_id)
-            except exception.NotFound:
+                return images[0]
+            except IndexError:
                 raise exception.ImageNotFound(image_id=ec2_id)
         image_type = ec2_id.split('-')[0]
         if ec2utils.image_type(image.get('container_format')) != image_type:
@@ -1634,11 +1460,10 @@ class CloudController(object):
             vm_state = instance['vm_state']
 
             # if the instance is in subtle state, refuse to proceed.
-            if vm_state not in (vm_states.ACTIVE, vm_states.SHUTOFF,
-                                vm_states.STOPPED):
+            if vm_state not in (vm_states.ACTIVE, vm_states.STOPPED):
                 raise exception.InstanceNotRunning(instance_id=ec2_instance_id)
 
-            if vm_state in (vm_states.ACTIVE, vm_states.SHUTOFF):
+            if vm_state == vm_states.ACTIVE:
                 restart_instance = True
                 self.compute_api.stop(context, instance)
 
@@ -1719,3 +1544,32 @@ class CloudController(object):
             self.compute_api.start(context, instance_id=instance_id)
 
         return {'imageId': image_id}
+
+
+class CloudSecurityGroupAPI(compute.api.SecurityGroupAPI):
+    @staticmethod
+    def raise_invalid_property(msg):
+        raise exception.InvalidParameterValue(err=msg)
+
+    @staticmethod
+    def raise_group_already_exists(msg):
+        raise exception.EC2APIError(message=msg)
+
+    @staticmethod
+    def raise_invalid_group(msg):
+        raise exception.InvalidGroup(reason=msg)
+
+    @staticmethod
+    def raise_invalid_cidr(cidr, decoding_exception=None):
+        if decoding_exception:
+            raise decoding_exception
+        else:
+            raise exception.EC2APIError(_("Invalid CIDR"))
+
+    @staticmethod
+    def raise_over_quota(msg):
+        raise exception.EC2APIError(message=msg)
+
+    @staticmethod
+    def raise_not_found(msg):
+        pass

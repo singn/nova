@@ -28,12 +28,12 @@ from nova import context
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log as logging
-from nova.notifier import test_notifier
 from nova.openstack.common import importutils
+from nova.openstack.common import log as logging
+from nova.openstack.common.notifier import test_notifier
+from nova.openstack.common import rpc
 import nova.policy
 from nova import quota
-from nova import rpc
 from nova import test
 import nova.volume.api
 
@@ -50,7 +50,7 @@ class VolumeTestCase(test.TestCase):
         self.compute = importutils.import_object(FLAGS.compute_manager)
         self.flags(compute_driver='nova.virt.fake.FakeDriver')
         self.stubs.Set(nova.flags.FLAGS, 'notification_driver',
-                'nova.notifier.test_notifier')
+                'nova.openstack.common.notifier.test_notifier')
         self.volume = importutils.import_object(FLAGS.volume_manager)
         self.context = context.get_admin_context()
         instance = db.instance_create(self.context, {})
@@ -120,6 +120,39 @@ class VolumeTestCase(test.TestCase):
                           db.volume_get,
                           self.context,
                           volume_id)
+
+    def _do_test_create_over_quota(self, resource, expected):
+        """Test volume creation over quota."""
+
+        def fake_reserve(context, **deltas):
+            kwargs = dict(overs=[resource],
+                          quotas=dict(gigabytes=1000, volumes=10),
+                          usages=dict(gigabytes=dict(reserved=1, in_use=999),
+                                      volumes=dict(reserved=1, in_use=9)))
+            raise exception.OverQuota(**kwargs)
+
+        def fake_commit(context, reservations):
+            self.fail('should not commit over quota')
+
+        self.stubs.Set(QUOTAS, 'reserve', fake_reserve)
+        self.stubs.Set(QUOTAS, 'commit', fake_commit)
+
+        volume_api = nova.volume.api.API()
+
+        self.assertRaises(expected,
+                          volume_api.create,
+                          self.context,
+                          2,
+                          'name',
+                          'description')
+
+    def test_create_volumes_over_quota(self):
+        self._do_test_create_over_quota('volumes',
+                                        exception.VolumeLimitExceeded)
+
+    def test_create_gigabytes_over_quota(self):
+        self._do_test_create_over_quota('gigabytes',
+                                        exception.VolumeSizeTooLarge)
 
     def test_delete_busy_volume(self):
         """Test volume survives deletion if driver reports it as busy."""
@@ -430,7 +463,7 @@ class DriverTestCase(test.TestCase):
             return self.output, None
         self.volume.driver.set_execute(_fake_execute)
 
-        log = logging.getLogger()
+        log = logging.getLogger('nova')
         self.stream = cStringIO.StringIO()
         log.logger.addHandler(logging.logging.StreamHandler(self.stream))
 

@@ -22,11 +22,11 @@ from nova import context
 from nova import db
 from nova import exception
 from nova import flags
-from nova.image import fake
-from nova import log as logging
 from nova.openstack.common import importutils
-from nova import rpc
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
 from nova import test
+from nova.tests.image import fake
 
 LOG = logging.getLogger(__name__)
 FLAGS = flags.FLAGS
@@ -50,7 +50,7 @@ class EC2ValidateTestCase(test.TestCase):
         self.scheduter = self.start_service('scheduler')
         self.network = self.start_service('network')
         self.volume = self.start_service('volume')
-        self.image_service = importutils.import_object(FLAGS.image_service)
+        self.image_service = fake.FakeImageService()
 
         self.user_id = 'fake'
         self.project_id = 'fake'
@@ -80,8 +80,14 @@ class EC2ValidateTestCase(test.TestCase):
                         'type': 'machine',
                         'image_state': 'available'}}
 
+        def fake_detail(self, context, **kwargs):
+            image = fake_show(self, context, None)
+            image['name'] = kwargs.get('name')
+            return [image]
+
+        fake.stub_out_image_service(self.stubs)
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'show_by_name', fake_show)
+        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
 
         # NOTE(comstud): Make 'cast' behave like a 'call' which will
         # ensure that operations complete
@@ -92,6 +98,10 @@ class EC2ValidateTestCase(test.TestCase):
                                'cedef40a-ed67-4d10-800e-17455edce175')
         db.api.s3_image_create(self.context,
                                '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6')
+
+    def tearDown(self):
+        super(EC2ValidateTestCase, self).tearDown()
+        fake.FakeImageService_reset()
 
     #EC2_API tests (InvalidInstanceID.Malformed)
     def test_console_output(self):

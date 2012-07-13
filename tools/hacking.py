@@ -275,7 +275,7 @@ class LocalizationError(Exception):
     pass
 
 
-def check_l18n():
+def check_i18n():
     """Generator that checks token stream for localization errors.
 
     Expects tokens to be ``send``ed one by one.
@@ -283,10 +283,12 @@ def check_l18n():
     """
     while True:
         try:
-            token_type, text, _, _, _ = yield
+            token_type, text, _, _, line = yield
         except GeneratorExit:
             return
-        if token_type == tokenize.NAME and text == "_":
+        if (token_type == tokenize.NAME and text == "_" and
+            not line.startswith('def _(msg):')):
+
             while True:
                 token_type, text, start, _, _ = yield
                 if token_type != tokenize.NL:
@@ -340,7 +342,7 @@ def nova_localization_strings(logical_line, tokens):
     N703: multiple positional placeholders
     """
 
-    gen = check_l18n()
+    gen = check_i18n()
     next(gen)
     try:
         map(gen.send, tokens)

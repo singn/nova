@@ -23,8 +23,7 @@ import re
 import string
 
 from nova import flags
-from nova import log as logging
-from nova.virt import xenapi
+from nova.openstack.common import log as logging
 
 
 FLAGS = flags.FLAGS

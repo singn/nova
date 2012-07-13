@@ -19,6 +19,7 @@ import mox
 import webob
 
 from nova.api.openstack.compute import servers
+from nova.compute import task_states
 from nova.compute import vm_states
 import nova.db
 from nova import exception
@@ -26,19 +27,21 @@ from nova import flags
 from nova.openstack.common import importutils
 from nova import test
 from nova.tests.api.openstack import fakes
+import nova.tests.image.fake
 from nova import utils
 
 
 FLAGS = flags.FLAGS
 FAKE_UUID = fakes.FAKE_UUID
+INSTANCE_IDS = {FAKE_UUID: 1}
 
 
 def return_server_not_found(context, uuid):
     raise exception.NotFound()
 
 
-def instance_update(context, instance_id, kwargs):
-    inst = fakes.stub_instance(instance_id)
+def instance_update(context, instance_uuid, kwargs):
+    inst = fakes.stub_instance(INSTANCE_IDS[instance_uuid])
     return (inst, inst)
 
 
@@ -58,16 +61,16 @@ class ServerActionsControllerTest(test.TestCase):
         super(ServerActionsControllerTest, self).setUp()
 
         self.stubs.Set(nova.db, 'instance_get_by_uuid',
-                fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
-                        host='fake_host'))
+                       fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
+                                               host='fake_host'))
         self.stubs.Set(nova.db, 'instance_update_and_get_original',
-                instance_update)
+                       instance_update)
 
         fakes.stub_out_glance(self.stubs)
         fakes.stub_out_nw_api(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_compute_api_snapshot(self.stubs)
-        fakes.stub_out_image_service(self.stubs)
+        nova.tests.image.fake.stub_out_image_service(self.stubs)
         service_class = 'nova.image.glance.GlanceImageService'
         self.service = importutils.import_object(service_class)
         self.service.delete_all()
@@ -460,8 +463,8 @@ class ServerActionsControllerTest(test.TestCase):
         context = req.environ['nova.context']
         update(context, mox.IgnoreArg(),
                 image_ref=self._image_href,
-                vm_state=vm_states.REBUILDING,
-                task_state=None, progress=0, **attributes).AndReturn(None)
+                task_state=task_states.REBUILDING,
+                progress=0, **attributes).AndReturn(None)
         self.mox.ReplayAll()
 
         self.controller._action_rebuild(req, FAKE_UUID, body)

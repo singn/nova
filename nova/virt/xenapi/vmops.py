@@ -19,8 +19,6 @@
 Management class for VM-related functions (spawn, reboot, etc).
 """
 
-import base64
-import binascii
 import cPickle as pickle
 import functools
 import os
@@ -28,6 +26,7 @@ import time
 import uuid
 
 from eventlet import greenthread
+import netaddr
 
 from nova.compute import api as compute
 from nova.compute import power_state
@@ -35,12 +34,14 @@ from nova import context as nova_context
 from nova import db
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import utils
 from nova.virt import driver
+from nova.virt.xenapi import agent
 from nova.virt.xenapi import firewall
 from nova.virt.xenapi import network_utils
 from nova.virt.xenapi import vm_utils
@@ -50,10 +51,6 @@ from nova.virt.xenapi import volume_utils
 LOG = logging.getLogger(__name__)
 
 xenapi_vmops_opts = [
-    cfg.IntOpt('agent_version_timeout',
-               default=300,
-               help='number of seconds to wait for agent '
-                    'to be fully operational'),
     cfg.IntOpt('xenapi_running_timeout',
                default=60,
                help='number of seconds to wait for instance '
@@ -121,8 +118,6 @@ def make_step_decorator(context, instance):
     the current-step-count would be 1 giving a progress of ``1 / 2 *
     100`` or 50%.
     """
-    instance_uuid = instance['uuid']
-
     step_info = dict(total=0, current=0)
 
     def bump_progress():
@@ -131,7 +126,7 @@ def make_step_decorator(context, instance):
                          step_info['total'] * 100)
         LOG.debug(_("Updating progress to %(progress)d"), locals(),
                   instance=instance)
-        db.instance_update(context, instance_uuid, {'progress': progress})
+        db.instance_update(context, instance['uuid'], {'progress': progress})
 
     def step_decorator(f):
         step_info['total'] += 1
@@ -152,7 +147,6 @@ class VMOps(object):
     Management class for VM-related tasks
     """
     def __init__(self, session):
-        self.XenAPI = session.get_imported_xenapi()
         self.compute_api = compute.API()
         self._session = session
         self.poll_rescue_last_ran = None
@@ -162,6 +156,7 @@ class VMOps(object):
         self.firewall_driver = fw_class(xenapi_session=self._session)
         vif_impl = importutils.import_class(FLAGS.xenapi_vif_driver)
         self.vif_driver = vif_impl(xenapi_session=self._session)
+        self.default_root_dev = '/dev/sda'
 
     def list_instances(self):
         """List VM instances."""
@@ -231,12 +226,13 @@ class VMOps(object):
                                   self._session.get_xenapi_host(),
                                   False, False)
 
-    def _create_disks(self, context, instance, image_meta):
+    def _create_disks(self, context, instance, image_meta,
+                      block_device_info=None):
         disk_image_type = vm_utils.determine_disk_image_type(image_meta)
-        vdis = vm_utils.create_image(context, self._session,
-                                     instance, instance.image_ref,
-                                     disk_image_type)
-
+        vdis = vm_utils.get_vdis_for_instance(context, self._session,
+                                          instance, instance.image_ref,
+                                          disk_image_type,
+                                          block_device_info=block_device_info)
         # Just get the VDI ref once
         for vdi in vdis.itervalues():
             vdi['ref'] = self._session.call_xenapi('VDI.get_by_uuid',
@@ -248,7 +244,8 @@ class VMOps(object):
 
         return vdis
 
-    def spawn(self, context, instance, image_meta, network_info):
+    def spawn(self, context, instance, image_meta, network_info,
+              block_device_info=None):
         step = make_step_decorator(context, instance)
 
         @step
@@ -263,10 +260,12 @@ class VMOps(object):
 
         @step
         def create_disks_step(undo_mgr):
-            vdis = self._create_disks(context, instance, image_meta)
+            vdis = self._create_disks(context, instance, image_meta,
+                                      block_device_info)
 
             def undo_create_disks():
-                self._safe_destroy_vdis([vdi['ref'] for vdi in vdis.values()])
+                vdi_refs = [vdi['ref'] for vdi in vdis.values()]
+                vm_utils.safe_destroy_vdis(self._session, vdi_refs)
 
             undo_mgr.undo_with(undo_create_disks)
             return vdis
@@ -292,8 +291,9 @@ class VMOps(object):
                 if kernel_file or ramdisk_file:
                     LOG.debug(_("Removing kernel/ramdisk files from dom0"),
                               instance=instance)
-                    self._destroy_kernel_ramdisk_plugin_call(kernel_file,
-                                                             ramdisk_file)
+                    vm_utils.destroy_kernel_ramdisk(
+                            self._session, kernel_file, ramdisk_file)
+
             undo_mgr.undo_with(undo_create_kernel_ramdisk)
             return kernel_file, ramdisk_file
 
@@ -331,8 +331,17 @@ class VMOps(object):
         def apply_security_group_filters_step(undo_mgr):
             self.firewall_driver.apply_instance_filter(instance, network_info)
 
+        @step
+        def bdev_set_default_root(undo_mgr):
+            if block_device_info:
+                LOG.debug(_("Block device information present: %s")
+                          % block_device_info, instance=instance)
+            if block_device_info and not block_device_info['root_device_name']:
+                block_device_info['root_device_name'] = self.default_root_dev
+
         undo_mgr = utils.UndoManager()
         try:
+            bdev_set_default_root(undo_mgr)
             vanity_step(undo_mgr)
 
             vdis = create_disks_step(undo_mgr)
@@ -384,7 +393,7 @@ class VMOps(object):
         if instance.vm_mode != vm_mode:
             # Update database with normalized (or determined) value
             db.instance_update(nova_context.get_admin_context(),
-                               instance['id'], {'vm_mode': vm_mode})
+                               instance['uuid'], {'vm_mode': vm_mode})
 
         vm_ref = vm_utils.create_vm(
             self._session, instance, kernel_file, ramdisk_file,
@@ -495,7 +504,7 @@ class VMOps(object):
         # Update agent, if necessary
         # This also waits until the agent starts
         LOG.debug(_("Querying agent version"), instance=instance)
-        version = self._get_agent_version(instance)
+        version = agent.get_agent_version(self._session, instance, vm_ref)
         if version:
             LOG.info(_('Instance agent version: %s'), version,
                      instance=instance)
@@ -504,8 +513,8 @@ class VMOps(object):
             cmp_version(version, agent_build['version']) < 0):
             LOG.info(_('Updating Agent to %s'), agent_build['version'],
                      instance=instance)
-            self._agent_update(instance, agent_build['url'],
-                               agent_build['md5hash'])
+            agent.agent_update(self._session, instance, vm_ref,
+                               agent_build['url'], agent_build['md5hash'])
 
         # if the guest agent is not available, configure the
         # instance, but skip the admin password configuration
@@ -526,17 +535,19 @@ class VMOps(object):
             for path, contents in instance.injected_files:
                 LOG.debug(_("Injecting file path: '%s'") % path,
                           instance=instance)
-                self.inject_file(instance, path, contents)
+                agent.inject_file(self._session, instance, vm_ref,
+                                  path, contents)
 
         admin_password = instance.admin_pass
         # Set admin password, if necessary
         if admin_password and not no_agent:
             LOG.debug(_("Setting admin password"), instance=instance)
-            self.set_admin_password(instance, admin_password)
+            agent.set_admin_password(self._session, instance, vm_ref,
+                                     admin_password)
 
         # Reset network config
         LOG.debug(_("Resetting network"), instance=instance)
-        self.reset_network(instance, vm_ref)
+        agent.resetnetwork(self._session, instance, vm_ref)
 
         # Set VCPU weight
         inst_type = db.instance_type_get(ctx, instance.instance_type_id)
@@ -591,37 +602,16 @@ class VMOps(object):
            Glance.
 
         """
-        template_vm_ref = None
-        try:
-            _snapshot_info = self._create_snapshot(instance)
-            template_vm_ref, template_vdi_uuids = _snapshot_info
-            # call plugin to ship snapshot off to glance
-            vm_utils.upload_image(context,
-                    self._session, instance, template_vdi_uuids, image_id)
-        finally:
-            if template_vm_ref:
-                self._destroy(instance, template_vm_ref,
-                              destroy_kernel_ramdisk=False)
+        vm_ref = self._get_vm_opaque_ref(instance)
+        label = "%s-snapshot" % instance.name
+
+        with vm_utils.snapshot_attached_here(
+                self._session, instance, vm_ref, label) as vdi_uuids:
+            vm_utils.upload_image(
+                    context, self._session, instance, vdi_uuids, image_id)
 
         LOG.debug(_("Finished snapshot and upload for VM"),
                   instance=instance)
-
-    def _create_snapshot(self, instance):
-        #TODO(sirp): Add quiesce and VSS locking support when Windows support
-        # is added
-
-        LOG.debug(_("Starting snapshot for VM"), instance=instance)
-        vm_ref = self._get_vm_opaque_ref(instance)
-
-        label = "%s-snapshot" % instance.name
-        try:
-            template_vm_ref, template_vdi_uuids = vm_utils.create_snapshot(
-                    self._session, instance, vm_ref, label)
-            return template_vm_ref, template_vdi_uuids
-        except self.XenAPI.Failure, exc:
-            LOG.error(_("Unable to Snapshot instance: %(exc)s"), locals(),
-                      instance=instance)
-            raise
 
     def _migrate_vhd(self, instance, vdi_uuid, dest, sr_path):
         instance_uuid = instance['uuid']
@@ -634,7 +624,7 @@ class VMOps(object):
             _params = {'params': pickle.dumps(params)}
             self._session.call_plugin('migration', 'transfer_vhd',
                                       _params)
-        except self.XenAPI.Failure:
+        except self._session.XenAPI.Failure:
             msg = _("Failed to transfer vhd to new host")
             raise exception.MigrationError(reason=msg)
 
@@ -654,10 +644,9 @@ class VMOps(object):
         # better approximation would use the percentage of the VM image that
         # has been streamed to the destination host.
         progress = round(float(step) / total_steps * 100)
-        instance_uuid = instance['uuid']
         LOG.debug(_("Updating progress to %(progress)d"), locals(),
                   instance=instance)
-        db.instance_update(context, instance_uuid, {'progress': progress})
+        db.instance_update(context, instance['uuid'], {'progress': progress})
 
     def migrate_disk_and_power_off(self, context, instance, dest,
                                    instance_type):
@@ -681,16 +670,18 @@ class VMOps(object):
         # from the snapshot creation
 
         base_copy_uuid = cow_uuid = None
-        template_vdi_uuids = template_vm_ref = None
-        try:
-            # 1. Create Snapshot
-            _snapshot_info = self._create_snapshot(instance)
-            template_vm_ref, template_vdi_uuids = _snapshot_info
+
+        # 1. Create Snapshot
+        label = "%s-snapshot" % instance.name
+        with vm_utils.snapshot_attached_here(
+                self._session, instance, vm_ref, label) as vdi_uuids:
             self._update_instance_progress(context, instance,
                                            step=1,
                                            total_steps=RESIZE_TOTAL_STEPS)
 
-            base_copy_uuid = template_vdi_uuids['image']
+            # FIXME(sirp): this needs to work with VDI chain of arbitrary
+            # length
+            base_copy_uuid = vdi_uuids[1]
             _vdi_info = vm_utils.get_vdi_for_vm_safely(self._session, vm_ref)
             vdi_ref, vm_vdi_rec = _vdi_info
             cow_uuid = vm_vdi_rec['uuid']
@@ -708,7 +699,8 @@ class VMOps(object):
                           instance=instance)
 
                 # 2. Power down the instance before resizing
-                self._shutdown(instance, vm_ref, hard=False)
+                vm_utils.shutdown_vm(
+                        self._session, instance, vm_ref, hard=False)
                 self._update_instance_progress(context, instance,
                                                step=2,
                                                total_steps=RESIZE_TOTAL_STEPS)
@@ -747,7 +739,8 @@ class VMOps(object):
                                                total_steps=RESIZE_TOTAL_STEPS)
 
                 # 3. Now power down the instance
-                self._shutdown(instance, vm_ref, hard=False)
+                vm_utils.shutdown_vm(
+                        self._session, instance, vm_ref, hard=False)
                 self._update_instance_progress(context, instance,
                                                step=3,
                                                total_steps=RESIZE_TOTAL_STEPS)
@@ -768,10 +761,6 @@ class VMOps(object):
             # extant until a confirm_resize don't collide.
             name_label = self._get_orig_vm_name_label(instance)
             vm_utils.set_vm_name_label(self._session, vm_ref, name_label)
-        finally:
-            if template_vm_ref:
-                self._destroy(instance, template_vm_ref,
-                              destroy_kernel_ramdisk=False)
 
         return vdis
 
@@ -844,141 +833,30 @@ class VMOps(object):
         # remove existing filters
         vm_ref = self._get_vm_opaque_ref(instance)
 
-        if reboot_type == "HARD":
-            self._session.call_xenapi('VM.hard_reboot', vm_ref)
-        else:
-            self._session.call_xenapi('VM.clean_reboot', vm_ref)
-
-    def _get_agent_version(self, instance):
-        """Get the version of the agent running on the VM instance."""
-
-        # The agent can be slow to start for a variety of reasons. On Windows,
-        # it will generally perform a setup process on first boot that can
-        # take a couple of minutes and then reboot. On Linux, the system can
-        # also take a while to boot. So we need to be more patient than
-        # normal as well as watch for domid changes
-
-        def _call():
-            # Send the encrypted password
-            resp = self._make_agent_call('version', instance)
-            if resp['returncode'] != '0':
-                LOG.error(_('Failed to query agent version: %(resp)r'),
-                          locals(), instance=instance)
-                return None
-            # Some old versions of the Windows agent have a trailing \\r\\n
-            # (ie CRLF escaped) for some reason. Strip that off.
-            return resp['message'].replace('\\r\\n', '')
-
-        vm_ref = self._get_vm_opaque_ref(instance)
-        vm_rec = self._session.call_xenapi("VM.get_record", vm_ref)
-
-        domid = vm_rec['domid']
-
-        expiration = time.time() + FLAGS.agent_version_timeout
-        while time.time() < expiration:
-            ret = _call()
-            if ret:
-                return ret
-
-            vm_rec = self._session.call_xenapi("VM.get_record", vm_ref)
-            if vm_rec['domid'] != domid:
-                newdomid = vm_rec['domid']
-                LOG.info(_('domid changed from %(domid)s to %(newdomid)s'),
-                         locals(), instance=instance)
-                domid = vm_rec['domid']
-
-        return None
-
-    def _agent_update(self, instance, url, md5sum):
-        """Update agent on the VM instance."""
-
-        # Send the encrypted password
-        args = {'url': url, 'md5sum': md5sum}
-        resp = self._make_agent_call('agentupdate', instance, args)
-        if resp['returncode'] != '0':
-            LOG.error(_('Failed to update agent: %(resp)r'), locals(),
-                      instance=instance)
-            return None
-        return resp['message']
+        try:
+            if reboot_type == "HARD":
+                self._session.call_xenapi('VM.hard_reboot', vm_ref)
+            else:
+                self._session.call_xenapi('VM.clean_reboot', vm_ref)
+        except self._session.XenAPI.Failure, exc:
+            details = exc.details
+            if (details[0] == 'VM_BAD_POWER_STATE' and
+                    details[-1] == 'halted'):
+                LOG.info(_("Starting halted instance found during reboot"),
+                    instance=instance)
+                self._session.call_xenapi('VM.start', vm_ref, False, False)
+                return
+            raise
 
     def set_admin_password(self, instance, new_pass):
-        """Set the root/admin password on the VM instance.
-
-        This is done via an agent running on the VM. Communication between nova
-        and the agent is done via writing xenstore records. Since communication
-        is done over the XenAPI RPC calls, we need to encrypt the password.
-        We're using a simple Diffie-Hellman class instead of the more advanced
-        one in M2Crypto for compatibility with the agent code.
-
-        """
-        # The simple Diffie-Hellman class is used to manage key exchange.
-        dh = SimpleDH()
-        key_init_args = {'pub': str(dh.get_public())}
-        resp = self._make_agent_call('key_init', instance, key_init_args)
-        # Successful return code from key_init is 'D0'
-        if resp['returncode'] != 'D0':
-            msg = _('Failed to exchange keys: %(resp)r') % locals()
-            LOG.error(msg, instance=instance)
-            raise Exception(msg)
-        # Some old versions of the Windows agent have a trailing \\r\\n
-        # (ie CRLF escaped) for some reason. Strip that off.
-        agent_pub = int(resp['message'].replace('\\r\\n', ''))
-        dh.compute_shared(agent_pub)
-        # Some old versions of Linux and Windows agent expect trailing \n
-        # on password to work correctly.
-        enc_pass = dh.encrypt(new_pass + '\n')
-        # Send the encrypted password
-        password_args = {'enc_pass': enc_pass}
-        resp = self._make_agent_call('password', instance, password_args)
-        # Successful return code from password is '0'
-        if resp['returncode'] != '0':
-            msg = _('Failed to update password: %(resp)r') % locals()
-            LOG.error(msg, instance=instance)
-            raise Exception(msg)
-        return resp['message']
+        """Set the root/admin password on the VM instance."""
+        vm_ref = self._get_vm_opaque_ref(instance)
+        agent.set_admin_password(self._session, instance, vm_ref, new_pass)
 
     def inject_file(self, instance, path, contents):
-        """Write a file to the VM instance.
-
-        The path to which it is to be written and the contents of the file
-        need to be supplied; both will be base64-encoded to prevent errors
-        with non-ASCII characters being transmitted. If the agent does not
-        support file injection, or the user has disabled it, a
-        NotImplementedError will be raised.
-
-        """
-        # Files/paths must be base64-encoded for transmission to agent
-        b64_path = base64.b64encode(path)
-        b64_contents = base64.b64encode(contents)
-
-        # Need to uniquely identify this request.
-        args = {'b64_path': b64_path, 'b64_contents': b64_contents}
-        # If the agent doesn't support file injection, a NotImplementedError
-        # will be raised with the appropriate message.
-        resp = self._make_agent_call('inject_file', instance, args)
-        if resp['returncode'] != '0':
-            LOG.error(_('Failed to inject file: %(resp)r'), locals(),
-                      instance=instance)
-            return None
-        return resp['message']
-
-    def _shutdown(self, instance, vm_ref, hard=True):
-        """Shutdown an instance."""
-        vm_rec = self._session.call_xenapi("VM.get_record", vm_ref)
-        state = vm_utils.compile_info(vm_rec)['state']
-        if state == power_state.SHUTDOWN:
-            LOG.warn(_("VM already halted, skipping shutdown..."),
-                     instance=instance)
-            return
-
-        LOG.debug(_("Shutting down VM"), instance=instance)
-        try:
-            if hard:
-                self._session.call_xenapi('VM.hard_shutdown', vm_ref)
-            else:
-                self._session.call_xenapi('VM.clean_shutdown', vm_ref)
-        except self.XenAPI.Failure, exc:
-            LOG.exception(exc)
+        """Write a file to the VM instance."""
+        vm_ref = self._get_vm_opaque_ref(instance)
+        agent.inject_file(self._session, instance, vm_ref, path, contents)
 
     def _find_root_vdi_ref(self, vm_ref):
         """Find and return the root vdi ref for a VM."""
@@ -994,21 +872,29 @@ class VMOps(object):
 
         raise exception.NotFound(_("Unable to find root VBD/VDI for VM"))
 
-    def _safe_destroy_vdis(self, vdi_refs):
-        """Destroys the requested VDIs, logging any StorageError exceptions."""
+    def _destroy_vdis(self, instance, vm_ref, block_device_info=None):
+        """Destroys all VDIs associated with a VM."""
+        instance_uuid = instance['uuid']
+        LOG.debug(_("Destroying VDIs for Instance %(instance_uuid)s")
+                  % locals())
+        nodestroy = []
+        if block_device_info:
+            for bdm in block_device_info['block_device_mapping']:
+                LOG.debug(bdm)
+                # bdm vols should be left alone if delete_on_termination
+                # is false, or they will be destroyed on cleanup_volumes
+                nodestroy.append(bdm['connection_info']['data']['vdi_uuid'])
+
+        vdi_refs = vm_utils.lookup_vm_vdis(self._session, vm_ref, nodestroy)
+
+        if not vdi_refs:
+            return
+
         for vdi_ref in vdi_refs:
             try:
                 vm_utils.destroy_vdi(self._session, vdi_ref)
             except volume_utils.StorageError as exc:
                 LOG.error(exc)
-
-    def _destroy_kernel_ramdisk_plugin_call(self, kernel, ramdisk):
-        args = {}
-        if kernel:
-            args['kernel-file'] = kernel
-        if ramdisk:
-            args['ramdisk-file'] = ramdisk
-        self._session.call_plugin('glance', 'remove_kernel_ramdisk', args)
 
     def _destroy_kernel_ramdisk(self, instance, vm_ref):
         """Three situations can occur:
@@ -1039,18 +925,8 @@ class VMOps(object):
         (kernel, ramdisk) = vm_utils.lookup_kernel_ramdisk(self._session,
                                                            vm_ref)
 
-        self._destroy_kernel_ramdisk_plugin_call(kernel, ramdisk)
+        vm_utils.destroy_kernel_ramdisk(self._session, kernel, ramdisk)
         LOG.debug(_("kernel/ramdisk files removed"), instance=instance)
-
-    def _destroy_vm(self, instance, vm_ref):
-        """Destroys a VM record."""
-        try:
-            self._session.call_xenapi('VM.destroy', vm_ref)
-        except self.XenAPI.Failure, exc:
-            LOG.exception(exc)
-            return
-
-        LOG.debug(_("VM destroyed"), instance=instance)
 
     def _destroy_rescue_instance(self, rescue_vm_ref, original_vm_ref):
         """Destroy a rescue instance."""
@@ -1064,12 +940,12 @@ class VMOps(object):
         vdi_refs = vm_utils.lookup_vm_vdis(self._session, rescue_vm_ref)
         root_vdi_ref = self._find_root_vdi_ref(original_vm_ref)
         vdi_refs = [vdi_ref for vdi_ref in vdi_refs if vdi_ref != root_vdi_ref]
-        self._safe_destroy_vdis(vdi_refs)
+        vm_utils.safe_destroy_vdis(self._session, vdi_refs)
 
         # Destroy Rescue VM
         self._session.call_xenapi("VM.destroy", rescue_vm_ref)
 
-    def destroy(self, instance, network_info):
+    def destroy(self, instance, network_info, block_device_info=None):
         """Destroy VM instance.
 
         This is the method exposed by xenapi_conn.destroy(). The rest of the
@@ -1088,10 +964,11 @@ class VMOps(object):
         if rescue_vm_ref:
             self._destroy_rescue_instance(rescue_vm_ref, vm_ref)
 
-        return self._destroy(instance, vm_ref, network_info)
+        return self._destroy(instance, vm_ref, network_info,
+                             block_device_info=block_device_info)
 
     def _destroy(self, instance, vm_ref, network_info=None,
-                 destroy_kernel_ramdisk=True):
+                 block_device_info=None):
         """Destroys VM instance by performing:
 
             1. A shutdown
@@ -1104,23 +981,18 @@ class VMOps(object):
             LOG.warning(_("VM is not present, skipping destroy..."),
                         instance=instance)
             return
-        is_snapshot = vm_utils.is_snapshot(self._session, vm_ref)
-        self._shutdown(instance, vm_ref)
+
+        vm_utils.shutdown_vm(self._session, instance, vm_ref)
 
         # Destroy VDIs
-        vdi_refs = vm_utils.lookup_vm_vdis(self._session, vm_ref)
-        self._safe_destroy_vdis(vdi_refs)
+        self._destroy_vdis(instance, vm_ref, block_device_info)
+        self._destroy_kernel_ramdisk(instance, vm_ref)
 
-        if destroy_kernel_ramdisk:
-            self._destroy_kernel_ramdisk(instance, vm_ref)
+        vm_utils.destroy_vm(self._session, instance, vm_ref)
 
-        self._destroy_vm(instance, vm_ref)
         self.unplug_vifs(instance, network_info)
-        # Remove security groups filters for instance
-        # Unless the vm is a snapshot
-        if not is_snapshot:
-            self.firewall_driver.unfilter_instance(instance,
-                                                   network_info=network_info)
+        self.firewall_driver.unfilter_instance(
+                instance, network_info=network_info)
 
     def pause(self, instance):
         """Pause VM instance."""
@@ -1135,11 +1007,13 @@ class VMOps(object):
     def suspend(self, instance):
         """Suspend the specified instance."""
         vm_ref = self._get_vm_opaque_ref(instance)
+        self._acquire_bootlock(vm_ref)
         self._session.call_xenapi('VM.suspend', vm_ref)
 
     def resume(self, instance):
         """Resume the specified instance."""
         vm_ref = self._get_vm_opaque_ref(instance)
+        self._release_bootlock(vm_ref)
         self._session.call_xenapi('VM.resume', vm_ref, False, True)
 
     def rescue(self, context, instance, network_info, image_meta):
@@ -1157,7 +1031,7 @@ class VMOps(object):
                                % instance.name)
 
         vm_ref = self._get_vm_opaque_ref(instance)
-        self._shutdown(instance, vm_ref)
+        vm_utils.shutdown_vm(self._session, instance, vm_ref)
         self._acquire_bootlock(vm_ref)
         instance._rescue = True
         self.spawn(context, instance, image_meta, network_info)
@@ -1193,7 +1067,7 @@ class VMOps(object):
     def power_off(self, instance):
         """Power off the specified instance."""
         vm_ref = self._get_vm_opaque_ref(instance)
-        self._shutdown(instance, vm_ref, hard=True)
+        vm_utils.shutdown_vm(self._session, instance, vm_ref, hard=True)
 
     def power_on(self, instance):
         """Power on the specified instance."""
@@ -1205,10 +1079,10 @@ class VMOps(object):
         task_refs = self._session.call_xenapi("task.get_by_name_label", task)
         for task_ref in task_refs:
             task_rec = self._session.call_xenapi("task.get_record", task_ref)
-            task_created = utils.parse_strtime(task_rec["created"].value,
-                    "%Y%m%dT%H:%M:%SZ")
+            task_created = timeutils.parse_strtime(task_rec["created"].value,
+                                                   "%Y%m%dT%H:%M:%SZ")
 
-            if utils.is_older_than(task_created, timeout):
+            if timeutils.is_older_than(task_created, timeout):
                 self._session.call_xenapi("task.cancel", task_ref)
 
     def poll_rebooting_instances(self, timeout):
@@ -1245,15 +1119,15 @@ class VMOps(object):
         last_ran = self.poll_rescue_last_ran
         if not last_ran:
             # We need a base time to start tracking.
-            self.poll_rescue_last_ran = utils.utcnow()
+            self.poll_rescue_last_ran = timeutils.utcnow()
             return
 
-        if not utils.is_older_than(last_ran, timeout):
+        if not timeutils.is_older_than(last_ran, timeout):
             # Do not run. Let's bail.
             return
 
         # Update the time tracker and proceed.
-        self.poll_rescue_last_ran = utils.utcnow()
+        self.poll_rescue_last_ran = timeutils.utcnow()
 
         rescue_vms = []
         for instance in self.list_instances():
@@ -1447,9 +1321,10 @@ class VMOps(object):
             for vif in network_info:
                 self.vif_driver.unplug(instance, vif)
 
-    def reset_network(self, instance, vm_ref=None):
+    def reset_network(self, instance):
         """Calls resetnetwork method in agent."""
-        self._make_agent_call('resetnetwork', instance, vm_ref=vm_ref)
+        vm_ref = self._get_vm_opaque_ref(instance)
+        agent.resetnetwork(self._session, instance, vm_ref)
 
     def inject_hostname(self, instance, vm_ref, hostname):
         """Inject the hostname of the instance into the xenstore."""
@@ -1470,24 +1345,6 @@ class VMOps(object):
                                       vm_ref=vm_ref, path=path,
                                       value=jsonutils.dumps(value))
 
-    def _make_agent_call(self, method, instance, args=None, vm_ref=None):
-        """Abstracts out the interaction with the agent xenapi plugin."""
-        if args is None:
-            args = {}
-        args['id'] = str(uuid.uuid4())
-        ret = self._make_plugin_call('agent', method, instance, vm_ref=vm_ref,
-                                     **args)
-        if isinstance(ret, dict):
-            return ret
-        try:
-            return jsonutils.loads(ret)
-        except TypeError:
-            LOG.error(_('The agent call to %(method)s returned an invalid'
-                        ' response: %(ret)r. path=%(path)s; args=%(args)r'),
-                      locals(), instance=instance)
-            return {'returncode': 'error',
-                    'message': 'unable to deserialize response'}
-
     def _make_plugin_call(self, plugin, method, instance, vm_ref=None,
                           **addl_args):
         """
@@ -1500,7 +1357,7 @@ class VMOps(object):
         args.update(addl_args)
         try:
             return self._session.call_plugin(plugin, method, args)
-        except self.XenAPI.Failure, e:
+        except self._session.XenAPI.Failure, e:
             err_msg = e.details[-1].splitlines()[-1]
             if 'TIMEOUT:' in err_msg:
                 LOG.error(_('TIMEOUT: The call to %(method)s timed out. '
@@ -1549,60 +1406,3 @@ class VMOps(object):
         """Removes filters for each VIF of the specified instance."""
         self.firewall_driver.unfilter_instance(instance_ref,
                                                network_info=network_info)
-
-
-class SimpleDH(object):
-    """
-    This class wraps all the functionality needed to implement
-    basic Diffie-Hellman-Merkle key exchange in Python. It features
-    intelligent defaults for the prime and base numbers needed for the
-    calculation, while allowing you to supply your own. It requires that
-    the openssl binary be installed on the system on which this is run,
-    as it uses that to handle the encryption and decryption. If openssl
-    is not available, a RuntimeError will be raised.
-    """
-    def __init__(self):
-        self._prime = 162259276829213363391578010288127
-        self._base = 5
-        self._public = None
-        self._shared = None
-        self.generate_private()
-
-    def generate_private(self):
-        self._private = int(binascii.hexlify(os.urandom(10)), 16)
-        return self._private
-
-    def get_public(self):
-        self._public = self.mod_exp(self._base, self._private, self._prime)
-        return self._public
-
-    def compute_shared(self, other):
-        self._shared = self.mod_exp(other, self._private, self._prime)
-        return self._shared
-
-    @staticmethod
-    def mod_exp(num, exp, mod):
-        """Efficient implementation of (num ** exp) % mod"""
-        result = 1
-        while exp > 0:
-            if (exp & 1) == 1:
-                result = (result * num) % mod
-            exp = exp >> 1
-            num = (num * num) % mod
-        return result
-
-    def _run_ssl(self, text, decrypt=False):
-        cmd = ['openssl', 'aes-128-cbc', '-A', '-a', '-pass',
-              'pass:%s' % self._shared, '-nosalt']
-        if decrypt:
-            cmd.append('-d')
-        out, err = utils.execute(*cmd, process_input=text)
-        if err:
-            raise RuntimeError(_('OpenSSL error: %s') % err)
-        return out
-
-    def encrypt(self, text):
-        return self._run_ssl(text).strip('\n')
-
-    def decrypt(self, text):
-        return self._run_ssl(text, decrypt=True)

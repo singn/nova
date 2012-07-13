@@ -30,7 +30,7 @@ from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import exception
 from nova import flags
-from nova import log as logging
+from nova.openstack.common import log as logging
 from nova import quota
 
 
@@ -48,25 +48,26 @@ _STATE_MAP = {
         task_states.REBOOTING: 'REBOOT',
         task_states.REBOOTING_HARD: 'HARD_REBOOT',
         task_states.UPDATING_PASSWORD: 'PASSWORD',
-        task_states.RESIZE_VERIFY: 'VERIFY_RESIZE',
+        task_states.REBUILDING: 'REBUILD',
+        task_states.REBUILD_BLOCK_DEVICE_MAPPING: 'REBUILD',
+        task_states.REBUILD_SPAWNING: 'REBUILD',
+        task_states.MIGRATING: 'MIGRATING',
+        task_states.RESIZE_PREP: 'RESIZE',
+        task_states.RESIZE_MIGRATING: 'RESIZE',
+        task_states.RESIZE_MIGRATED: 'RESIZE',
+        task_states.RESIZE_FINISH: 'RESIZE',
     },
     vm_states.BUILDING: {
         'default': 'BUILD',
     },
-    vm_states.REBUILDING: {
-        'default': 'REBUILD',
-    },
     vm_states.STOPPED: {
-        'default': 'STOPPED',
-    },
-    vm_states.SHUTOFF: {
         'default': 'SHUTOFF',
     },
-    vm_states.MIGRATING: {
-        'default': 'MIGRATING',
-    },
-    vm_states.RESIZING: {
-        'default': 'RESIZE',
+    vm_states.RESIZED: {
+        'default': 'VERIFY_RESIZE',
+        # Note(maoy): the OS API spec 1.1 doesn't have CONFIRMING_RESIZE
+        # state so we comment that out for future reference only.
+        #task_states.RESIZE_CONFIRMING: 'CONFIRMING_RESIZE',
         task_states.RESIZE_REVERTING: 'REVERT_RESIZE',
     },
     vm_states.PAUSED: {
@@ -84,7 +85,7 @@ _STATE_MAP = {
     vm_states.DELETED: {
         'default': 'DELETED',
     },
-    vm_states.SOFT_DELETE: {
+    vm_states.SOFT_DELETED: {
         'default': 'DELETED',
     },
 }
@@ -92,10 +93,12 @@ _STATE_MAP = {
 
 def status_from_state(vm_state, task_state='default'):
     """Given vm_state and task_state, return a status string."""
-    task_map = _STATE_MAP.get(vm_state, dict(default='UNKNOWN_STATE'))
+    task_map = _STATE_MAP.get(vm_state, dict(default='UNKNOWN'))
     status = task_map.get(task_state, task_map['default'])
-    LOG.debug("Generated %(status)s from vm_state=%(vm_state)s "
-              "task_state=%(task_state)s." % locals())
+    if status == "UNKNOWN":
+        LOG.error(_("status is UNKNOWN from vm_state=%(vm_state)s "
+                    "task_state=%(task_state)s. Bad upgrade or db "
+                    "corrupted?") % locals())
     return status
 
 
@@ -307,7 +310,6 @@ def dict_to_query_str(params):
 
 def get_networks_for_instance_from_nw_info(nw_info):
     networks = {}
-    LOG.debug(_('Converting nw_info: %s') % nw_info)
     for vif in nw_info:
         ips = vif.fixed_ips()
         floaters = vif.floating_ips()
@@ -317,7 +319,6 @@ def get_networks_for_instance_from_nw_info(nw_info):
 
         networks[label]['ips'].extend(ips)
         networks[label]['floating_ips'].extend(floaters)
-        LOG.debug(_('Converted networks: %s') % networks)
     return networks
 
 

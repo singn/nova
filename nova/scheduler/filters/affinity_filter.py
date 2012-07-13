@@ -18,7 +18,6 @@
 import netaddr
 
 from nova.compute import api as compute
-from nova import flags
 from nova.scheduler import filters
 
 
@@ -26,8 +25,11 @@ class AffinityFilter(filters.BaseHostFilter):
     def __init__(self):
         self.compute_api = compute.API()
 
-    def _affinity_host(self, context, instance_id):
-        return self.compute_api.get(context, instance_id)['host']
+    def _all_hosts(self, context):
+        all_hosts = {}
+        for instance in self.compute_api.get_all(context):
+            all_hosts[instance['uuid']] = instance['host']
+        return all_hosts
 
 
 class DifferentHostFilter(AffinityFilter):
@@ -39,9 +41,12 @@ class DifferentHostFilter(AffinityFilter):
         me = host_state.host
 
         affinity_uuids = scheduler_hints.get('different_host', [])
+        if isinstance(affinity_uuids, basestring):
+            affinity_uuids = [affinity_uuids]
         if affinity_uuids:
+            all_hosts = self._all_hosts(context)
             return not any([i for i in affinity_uuids
-                              if self._affinity_host(context, i) == me])
+                              if all_hosts.get(i) == me])
         # With no different_host key
         return True
 
@@ -57,10 +62,13 @@ class SameHostFilter(AffinityFilter):
         me = host_state.host
 
         affinity_uuids = scheduler_hints.get('same_host', [])
+        if isinstance(affinity_uuids, basestring):
+            affinity_uuids = [affinity_uuids]
         if affinity_uuids:
+            all_hosts = self._all_hosts(context)
             return any([i for i
                           in affinity_uuids
-                          if self._affinity_host(context, i) == me])
+                          if all_hosts.get(i) == me])
         # With no same_host key
         return True
 

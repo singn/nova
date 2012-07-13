@@ -25,23 +25,19 @@ import sys
 import time
 import urlparse
 
+import glance.client
 from glance.common import exception as glance_exception
 
 from nova import exception
 from nova import flags
-from nova import log as logging
-from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import utils
 
 
 LOG = logging.getLogger(__name__)
-
-
 FLAGS = flags.FLAGS
-
-
-GlanceClient = importutils.import_class('glance.client.Client')
 
 
 def _parse_image_ref(image_href):
@@ -60,17 +56,16 @@ def _parse_image_ref(image_href):
 
 
 def _create_glance_client(context, host, port):
+    params = {}
     if FLAGS.auth_strategy == 'keystone':
-        # NOTE(dprince): Glance client just needs auth_tok right? Should we
-        # add username and tenant to the creds below?
-        creds = {'strategy': 'keystone',
-                 'username': context.user_id,
-                 'tenant': context.project_id}
-        glance_client = GlanceClient(host, port, auth_tok=context.auth_token,
-                                     creds=creds)
-    else:
-        glance_client = GlanceClient(host, port)
-    return glance_client
+        params['creds'] = {
+            'strategy': 'keystone',
+            'username': context.user_id,
+            'tenant': context.project_id,
+        }
+        params['auth_tok'] = context.auth_token
+
+    return glance.client.Client(host, port, **params)
 
 
 def pick_glance_api_server():
@@ -88,13 +83,16 @@ def pick_glance_api_server():
     return host, port
 
 
-def get_glance_client(context, image_href):
+def _get_glance_client(context, image_href):
     """Get the correct glance client and id for the given image_href.
 
     The image_href param can be an href of the form
     http://myglanceserver:9292/images/42, or just an int such as 42. If the
     image_href is an int, then flags are used to create the default
     glance client.
+
+    NOTE: Do not use this or glance.client directly, all other code
+    should be using GlanceImageService.
 
     :param image_href: image ref/id for an image
     :returns: a tuple of the form (glance_client, image_id)
@@ -151,21 +149,6 @@ class GlanceImageService(object):
 
         raise exception.GlanceConnectionFailed(
                 reason=_('Maximum attempts reached'))
-
-    def index(self, context, **kwargs):
-        """Calls out to Glance for a list of images available."""
-        params = self._extract_query_params(kwargs)
-        image_metas = self._get_images(context, **params)
-
-        images = []
-        for image_meta in image_metas:
-            # NOTE(sirp): We need to use `get_images_detailed` and not
-            # `get_images` here because we need `is_public` and `properties`
-            # included so we can filter by user
-            if self._is_image_available(context, image_meta):
-                meta_subset = utils.subset_dict(image_meta, ('id', 'name'))
-                images.append(meta_subset)
-        return images
 
     def detail(self, context, **kwargs):
         """Calls out to Glance for a list of detailed image information."""
@@ -246,15 +229,7 @@ class GlanceImageService(object):
         base_image_meta = self._translate_from_glance(image_meta)
         return base_image_meta
 
-    def show_by_name(self, context, name):
-        """Returns a dict containing image data for the given name."""
-        image_metas = self.detail(context, filters={'name': name})
-        try:
-            return image_metas[0]
-        except (IndexError, TypeError):
-            raise exception.ImageNotFound(image_id=name)
-
-    def get(self, context, image_id, data):
+    def download(self, context, image_id, data):
         """Calls out to Glance for metadata and data and writes data."""
         try:
             image_meta, image_chunks = self._call_retry(context, 'get_image',
@@ -264,9 +239,6 @@ class GlanceImageService(object):
 
         for chunk in image_chunks:
             data.write(chunk)
-
-        base_image_meta = self._translate_from_glance(image_meta)
-        return base_image_meta
 
     def create(self, context, image_meta, data=None):
         """Store the image data and return the new image id.
@@ -318,23 +290,6 @@ class GlanceImageService(object):
         """
         # NOTE(vish): show is to check if image is available
         image_meta = self.show(context, image_id)
-
-        if FLAGS.auth_strategy == 'deprecated':
-            # NOTE(parthi): only allow image deletions if the user
-            # is a member of the project owning the image, in case of
-            # setup without keystone
-            # TODO(parthi): Currently this access control breaks if
-            # 1. Image is not owned by a project
-            # 2. Deleting user is not bound a project
-            properties = image_meta['properties']
-            if (context.project_id and ('project_id' in properties)
-                and (context.project_id != properties['project_id'])):
-                raise exception.NotAuthorized(_("Not the image owner"))
-
-            if (context.project_id and ('owner_id' in properties)
-                and (context.project_id != properties['owner_id'])):
-                raise exception.NotAuthorized(_("Not the image owner"))
-
         try:
             result = self._get_client(context).delete_image(image_id)
         except glance_exception.NotFound:
@@ -404,7 +359,7 @@ def _parse_glance_iso8601_timestamp(timestamp):
 
     for iso_format in iso_formats:
         try:
-            return utils.parse_strtime(timestamp, iso_format)
+            return timeutils.parse_strtime(timestamp, iso_format)
         except ValueError:
             pass
 
@@ -412,7 +367,7 @@ def _parse_glance_iso8601_timestamp(timestamp):
                        'signatures: %(iso_formats)s') % locals())
 
 
-# TODO(yamahata): use block-device-mapping extension to glance
+# NOTE(bcwaldon): used to store non-string data in glance metadata
 def _json_loads(properties, attr):
     prop = properties[attr]
     if isinstance(prop, basestring):
@@ -429,7 +384,7 @@ _CONVERT_PROPS = ('block_device_mapping', 'mappings')
 
 
 def _convert(method, metadata):
-    metadata = copy.deepcopy(metadata)  # don't touch original metadata
+    metadata = copy.deepcopy(metadata)
     properties = metadata.get('properties')
     if properties:
         for attr in _CONVERT_PROPS:
@@ -448,7 +403,7 @@ def _convert_to_string(metadata):
 
 
 def _limit_attributes(image_meta):
-    IMAGE_ATTRIBUTES = ['size', 'disk_format',
+    IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
                         'container_format', 'checksum', 'id',
                         'name', 'created_at', 'updated_at',
                         'deleted_at', 'deleted', 'status',
@@ -507,3 +462,31 @@ def _translate_plain_exception(exc_type, exc_value):
     if exc_type is glance_exception.Invalid:
         return exception.Invalid(exc_value)
     return exc_value
+
+
+def get_remote_image_service(context, image_href):
+    """Create an image_service and parse the id from the given image_href.
+
+    The image_href param can be an href of the form
+    'http://example.com:9292/v1/images/b8b2c6f7-7345-4e2f-afa2-eedaba9cbbe3',
+    or just an id such as 'b8b2c6f7-7345-4e2f-afa2-eedaba9cbbe3'. If the
+    image_href is a standalone id, then the default image service is returned.
+
+    :param image_href: href that describes the location of an image
+    :returns: a tuple of the form (image_service, image_id)
+
+    """
+    #NOTE(bcwaldon): If image_href doesn't look like a URI, assume its a
+    # standalone image ID
+    if '/' not in str(image_href):
+        image_service = get_default_image_service()
+        image_id = image_href
+    else:
+        (glance_client, image_id) = _get_glance_client(context, image_href)
+        image_service = GlanceImageService(glance_client)
+
+    return (image_service, image_id)
+
+
+def get_default_image_service():
+    return GlanceImageService()

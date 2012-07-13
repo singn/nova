@@ -34,10 +34,11 @@ from nova.api import validator
 from nova import context
 from nova import exception
 from nova import flags
-from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import utils
 from nova import wsgi
 
@@ -106,7 +107,7 @@ class RequestLogging(wsgi.Middleware):
 
     @webob.dec.wsgify(RequestClass=wsgi.Request)
     def __call__(self, req):
-        start = utils.utcnow()
+        start = timeutils.utcnow()
         rv = req.get_response(self.application)
         self.log_request_completion(rv, req, start)
         return rv
@@ -120,7 +121,7 @@ class RequestLogging(wsgi.Middleware):
             controller = None
             action = None
         ctxt = request.environ.get('nova.context', None)
-        delta = utils.utcnow() - start
+        delta = timeutils.utcnow() - start
         seconds = delta.seconds
         microseconds = delta.microseconds
         LOG.info(
@@ -260,13 +261,16 @@ class EC2KeystoneAuth(wsgi.Middleware):
         if FLAGS.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For',
                                              remote_address)
+
+        catalog = result['access']['serviceCatalog']
         ctxt = context.RequestContext(user_id,
                                       project_id,
                                       user_name=user_name,
                                       project_name=project_name,
                                       roles=roles,
                                       auth_token=token_id,
-                                      remote_address=remote_address)
+                                      remote_address=remote_address,
+                                      service_catalog=catalog)
 
         req.environ['nova.context'] = ctxt
 
@@ -471,7 +475,7 @@ class Executor(wsgi.Application):
         except exception.InstanceNotFound as ex:
             LOG.info(_('InstanceNotFound raised: %s'), unicode(ex),
                      context=context)
-            ec2_id = ec2utils.id_to_ec2_id(ex.kwargs['instance_id'])
+            ec2_id = ec2utils.id_to_ec2_inst_id(ex.kwargs['instance_id'])
             message = ex.message % {'instance_id': ec2_id}
             return ec2_error(req, request_id, type(ex).__name__, message)
         except exception.VolumeNotFound as ex:

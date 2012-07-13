@@ -25,10 +25,10 @@ from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import flags
-import nova.image.fake
-from nova import log as logging
+import nova.network
 from nova import notifications
-from nova.notifier import test_notifier
+from nova.openstack.common import log as logging
+from nova.openstack.common.notifier import test_notifier
 from nova import test
 from nova.tests import fake_network
 
@@ -40,19 +40,21 @@ flags.DECLARE('stub_network', 'nova.compute.manager')
 class NotificationsTestCase(test.TestCase):
 
     def setUp(self):
+        super(NotificationsTestCase, self).setUp()
+
+        self.net_info = fake_network.fake_get_instance_nw_info(self.stubs, 1,
+                                                        1, spectacular=True)
 
         def fake_get_nw_info(cls, ctxt, instance):
             self.assertTrue(ctxt.is_admin)
-            return fake_network.fake_get_instance_nw_info(self.stubs, 1, 1,
-                spectacular=True)
+            return self.net_info
 
-        super(NotificationsTestCase, self).setUp()
         self.stubs.Set(nova.network.API, 'get_instance_nw_info',
                 fake_get_nw_info)
 
         self.flags(compute_driver='nova.virt.fake.FakeDriver',
                    stub_network=True,
-                   notification_driver='nova.notifier.test_notifier',
+            notification_driver='nova.openstack.common.notifier.test_notifier',
                    network_manager='nova.network.manager.FlatManager',
                    notify_on_state_change="vm_and_task_state",
                    host='testhost')
@@ -117,7 +119,7 @@ class NotificationsTestCase(test.TestCase):
         # pretend we just transitioned to ACTIVE:
         params = {"vm_state": vm_states.ACTIVE}
         (old_ref, new_ref) = db.instance_update_and_get_original(self.context,
-                self.instance["id"], params)
+                self.instance['uuid'], params)
         notifications.send_update(self.context, old_ref, new_ref)
 
         self.assertEquals(1, len(test_notifier.NOTIFICATIONS))
@@ -127,7 +129,7 @@ class NotificationsTestCase(test.TestCase):
         # pretend we just transitioned to task SPAWNING:
         params = {"task_state": task_states.SPAWNING}
         (old_ref, new_ref) = db.instance_update_and_get_original(self.context,
-                self.instance["id"], params)
+                self.instance['uuid'], params)
         print old_ref["task_state"]
         print new_ref["task_state"]
         notifications.send_update(self.context, old_ref, new_ref)
@@ -198,3 +200,9 @@ class NotificationsTestCase(test.TestCase):
         # service name should default to 'compute'
         notif = test_notifier.NOTIFICATIONS[0]
         self.assertEquals('compute.someotherhost', notif['publisher_id'])
+
+    def test_payload_has_fixed_ip_labels(self):
+        usage = notifications.usage_from_instance(self.context, self.instance,
+                                                  self.net_info, None)
+        self.assertTrue("fixed_ips" in usage)
+        self.assertEquals(usage["fixed_ips"][0]["label"], "test1")

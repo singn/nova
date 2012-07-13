@@ -25,11 +25,11 @@ import functools
 from nova.db import base
 from nova import exception
 from nova import flags
-from nova import log as logging
+from nova.openstack.common import log as logging
+from nova.openstack.common import rpc
+from nova.openstack.common import timeutils
 import nova.policy
 from nova import quota
-from nova import rpc
-from nova import utils
 
 FLAGS = flags.FLAGS
 flags.DECLARE('storage_availability_zone', 'nova.volume.manager')
@@ -82,11 +82,28 @@ class API(base.Base):
 
         try:
             reservations = QUOTAS.reserve(context, volumes=1, gigabytes=size)
-        except exception.OverQuota:
+        except exception.OverQuota as e:
+            overs = e.kwargs['overs']
+            usages = e.kwargs['usages']
+            quotas = e.kwargs['quotas']
+
+            def _consumed(name):
+                return (usages[name]['reserved'] + usages[name]['in_use'])
+
             pid = context.project_id
-            LOG.warn(_("Quota exceeded for %(pid)s, tried to create"
-                    " %(size)sG volume") % locals())
-            raise exception.VolumeSizeTooLarge()
+            if 'gigabytes' in overs:
+                consumed = _consumed('gigabytes')
+                quota = quotas['gigabytes']
+                LOG.warn(_("Quota exceeded for %(pid)s, tried to create "
+                           "%(size)sG volume (%(consumed)dG of %(quota)dG "
+                           "already consumed)") % locals())
+                raise exception.VolumeSizeTooLarge()
+            elif 'volumes' in overs:
+                consumed = _consumed('volumes')
+                LOG.warn(_("Quota exceeded for %(pid)s, tried to create "
+                           "volume (%(consumed)d volumes already consumed)")
+                           % locals())
+                raise exception.VolumeLimitExceeded(allowed=quotas['volumes'])
 
         if availability_zone is None:
             availability_zone = FLAGS.storage_availability_zone
@@ -136,7 +153,7 @@ class API(base.Base):
             msg = _("Volume still has %d dependent snapshots") % len(snapshots)
             raise exception.InvalidVolume(reason=msg)
 
-        now = utils.utcnow()
+        now = timeutils.utcnow()
         self.db.volume_update(context, volume_id, {'status': 'deleting',
                                                    'terminated_at': now})
         host = volume['host']

@@ -22,14 +22,16 @@ Tests For Scheduler
 from nova.compute import api as compute_api
 from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
+from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import exception
 from nova import flags
 from nova.openstack.common import jsonutils
-from nova import rpc
-from nova.rpc import common as rpc_common
+from nova.openstack.common import rpc
+from nova.openstack.common.rpc import common as rpc_common
+from nova.openstack.common import timeutils
 from nova.scheduler import driver
 from nova.scheduler import manager
 from nova import test
@@ -453,7 +455,7 @@ class SchedulerTestCase(test.TestCase):
         self.driver._live_migration_common_check(self.context, instance,
                 dest, block_migration, disk_over_commit)
         db.instance_update_and_get_original(self.context, instance['id'],
-                {"vm_state": vm_states.MIGRATING}).AndReturn(
+                {"task_state": task_states.MIGRATING}).AndReturn(
                         (instance, instance))
 
         driver.cast_to_compute_host(self.context, instance['host'],
@@ -474,21 +476,21 @@ class SchedulerTestCase(test.TestCase):
         rpc.call(self.context, 'dest_queue',
                 {'method': 'create_shared_storage_test_file',
                  'args': {},
-                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None
-                ).AndReturn(tmp_filename)
+                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION},
+                None).AndReturn(tmp_filename)
         rpc.queue_get_for(self.context, FLAGS.compute_topic,
                 instance['host']).AndReturn('src_queue')
         rpc.call(self.context, 'src_queue',
                 {'method': 'check_shared_storage_test_file',
                  'args': {'filename': tmp_filename},
-                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None
-                ).AndReturn(check_result)
+                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION},
+                None).AndReturn(check_result)
         rpc.queue_get_for(self.context, FLAGS.compute_topic,
                 dest).AndReturn('dest_queue')
         rpc.cast(self.context, 'dest_queue',
                 {'method': 'cleanup_shared_storage_test_file',
                  'args': {'filename': tmp_filename},
-                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION})
+                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
 
     def test_live_migration_all_checks_pass(self):
         """Test live migration when all checks pass."""
@@ -533,7 +535,7 @@ class SchedulerTestCase(test.TestCase):
             'args': {
                 'instance_name': instance['name'],
             },
-            'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION,
+            'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION,
         }
         instance_disk_info = [{'disk_size': 1024 * (1024 ** 3)}]
         rpc.call(self.context,
@@ -558,11 +560,11 @@ class SchedulerTestCase(test.TestCase):
         rpc.call(self.context, 'dest_queue',
                 {'method': 'compare_cpu',
                  'args': {'cpu_info': 'fake_cpu_info'},
-                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None
-                ).AndReturn(True)
+                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION},
+                None).AndReturn(True)
 
         db.instance_update_and_get_original(self.context, instance['id'],
-                {"vm_state": vm_states.MIGRATING}).AndReturn(
+                {"task_state": task_states.MIGRATING}).AndReturn(
                         (instance, instance))
 
         driver.cast_to_compute_host(self.context, instance['host'],
@@ -744,7 +746,7 @@ class SchedulerTestCase(test.TestCase):
             'args': {
                 'instance_name': instance['name'],
             },
-            'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION,
+            'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION,
         }
         instance_disk_info = [{'disk_size': 1024 * (1024 ** 3)}]
         rpc.call(self.context,
@@ -924,8 +926,8 @@ class SchedulerTestCase(test.TestCase):
         rpc.call(self.context, 'dest_queue',
                 {'method': 'compare_cpu',
                  'args': {'cpu_info': 'fake_cpu_info'},
-                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None
-                ).AndRaise(rpc_common.RemoteError())
+                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION},
+                None).AndRaise(rpc_common.RemoteError())
 
         self.mox.ReplayAll()
         self.assertRaises(rpc_common.RemoteError,
@@ -983,12 +985,12 @@ class SchedulerDriverModuleTestCase(test.TestCase):
                        'extra_arg': 'meow'}
         queue = 'fake_queue'
 
-        self.mox.StubOutWithMock(utils, 'utcnow')
+        self.mox.StubOutWithMock(timeutils, 'utcnow')
         self.mox.StubOutWithMock(db, 'volume_update')
         self.mox.StubOutWithMock(rpc, 'queue_get_for')
         self.mox.StubOutWithMock(rpc, 'cast')
 
-        utils.utcnow().AndReturn('fake-now')
+        timeutils.utcnow().AndReturn('fake-now')
         db.volume_update(self.context, 31337,
                 {'host': host, 'scheduled_at': 'fake-now'})
         rpc.queue_get_for(self.context, 'volume', host).AndReturn(queue)
@@ -1043,12 +1045,12 @@ class SchedulerDriverModuleTestCase(test.TestCase):
                        'extra_arg': 'meow'}
         queue = 'fake_queue'
 
-        self.mox.StubOutWithMock(utils, 'utcnow')
+        self.mox.StubOutWithMock(timeutils, 'utcnow')
         self.mox.StubOutWithMock(db, 'instance_update')
         self.mox.StubOutWithMock(rpc, 'queue_get_for')
         self.mox.StubOutWithMock(rpc, 'cast')
 
-        utils.utcnow().AndReturn('fake-now')
+        timeutils.utcnow().AndReturn('fake-now')
         db.instance_update(self.context, 31337,
                 {'host': host, 'scheduled_at': 'fake-now'})
         rpc.queue_get_for(self.context, 'compute', host).AndReturn(queue)
