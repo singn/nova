@@ -109,20 +109,25 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
             msg = _('API %(name)s failed: %(reason)s')
             raise exception.NovaException(msg % locals())
 
-    def _create_client(self, wsdl_url, cache, login, password, hostname, port):
+    def _create_client(self, **kwargs):
         """
-        Instantiate a "suds" client to make web services calls to the
+        Instantiate a web services client.
+
+        This method creates a "suds" client to make web services calls to the
         DFM server. Note that the WSDL file is quite large and may take
         a few seconds to parse.
         """
+        wsdl_url = kwargs['wsdl_url']
         LOG.debug('Using WSDL: %s' % wsdl_url)
-        if cache:
-            self.client = client.Client(wsdl_url, username=login,
-                                        password=password)
+        if kwargs['cache']:
+            self.client = client.Client(wsdl_url, username=kwargs['login'],
+                                        password=kwargs['password'])
         else:
-            self.client = client.Client(wsdl_url, username=login,
-                                        password=password, cache=None)
-        soap_url = 'http://%s:%s/apis/soap/v1' % (hostname, port)
+            self.client = client.Client(wsdl_url, username=kwargs['login'],
+                                        password=kwargs['password'],
+                                        cache=None)
+        soap_url = 'http://%s:%s/apis/soap/v1' % (kwargs['hostname'],
+                                                  kwargs['port'])
         LOG.debug('Using DFM server: %s' % soap_url)
         self.client.set_options(location=soap_url)
 
@@ -155,20 +160,25 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def do_setup(self, context):
         """
+        Setup the NetApp Volume driver.
+
         Called one time by the manager after the driver is loaded.
         Validate the flags we care about and setup the suds (web services)
         client.
         """
         self._check_flags()
-        self._create_client(FLAGS.netapp_wsdl_url, True, FLAGS.netapp_login,
-            FLAGS.netapp_password, FLAGS.netapp_server_hostname,
-            FLAGS.netapp_server_port)
+        self._create_client(wsdl_url=FLAGS.netapp_wsdl_url,
+            login=FLAGS.netapp_login, password=FLAGS.netapp_password,
+            hostname=FLAGS.netapp_server_hostname,
+            port=FLAGS.netapp_server_port, cache=True)
         self._set_storage_service(FLAGS.netapp_storage_service)
         self._set_storage_service_prefix(FLAGS.netapp_storage_service_prefix)
         self._set_vfiler(FLAGS.netapp_vfiler)
 
     def check_for_setup_error(self):
         """
+        Check that the driver is working and can communicate.
+
         Invoke a web services API to make sure we can talk to the server.
         Also perform the discovery of datasets and LUNs from DFM.
         """
@@ -223,6 +233,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _discover_luns(self):
         """
+        Discover the LUNs from DFM.
+
         Discover all of the OpenStack-created datasets and LUNs in the DFM
         database.
         """
@@ -256,6 +268,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _get_job_progress(self, job_id):
         """
+        Get progress of one running DFM job.
+
         Obtain the latest progress report for the job and return the
         list of progress events.
         """
@@ -276,6 +290,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _wait_for_job(self, job_id):
         """
+        Wait until a job terminates.
+
         Poll the job until it completes or an error is detected. Return the
         final list of progress events if it completes successfully.
         """
@@ -290,9 +306,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
             time.sleep(5)
 
     def _dataset_name(self, project, ss_type):
-        """
-        Return the dataset name for a given project and volume type.
-        """
+        """Return the dataset name for a given project and volume type."""
         _project = project.replace(' ', '_').replace('-', '_')
         dataset_name = self.DATASET_PREFIX + _project
         if not ss_type:
@@ -301,9 +315,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         return dataset_name + '_' + _type
 
     def _get_dataset(self, dataset_name):
-        """
-        Lookup a dataset by name in the list of discovered datasets.
-        """
+        """Lookup a dataset by name in the list of discovered datasets."""
         for dataset in self.discovered_datasets:
             if dataset.name == dataset_name:
                 return dataset
@@ -311,9 +323,10 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _create_dataset(self, dataset_name, project, ss_type):
         """
-        Create a new dataset using the storage service. The export settings are
-        set to create iSCSI LUNs aligned for Linux. Returns the ID of the new
-        dataset.
+        Create a new dataset using the storage service.
+
+        The export settings are set to create iSCSI LUNs aligned for Linux.
+        Returns the ID of the new dataset.
         """
         if ss_type and not self.storage_service_prefix:
             msg = _('Attempt to use volume_type without specifying '
@@ -363,10 +376,11 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _provision(self, name, description, project, ss_type, size):
         """
-        Provision a LUN through provisioning manager. The LUN will be created
-        inside a dataset associated with the project. If the dataset doesn't
-        already exist, we create it using the storage service specified in the
-        nova conf.
+        Provision a LUN through provisioning manager.
+
+        The LUN will be created inside a dataset associated with the project.
+        If the dataset doesn't already exist, we create it using the storage
+        service specified in the nova conf.
         """
         dataset_name = self._dataset_name(project, ss_type)
         dataset = self._get_dataset(dataset_name)
@@ -423,6 +437,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _remove_destroy(self, name, project):
         """
+        Remove the LUN from the dataset, also destroying it.
+
         Remove the LUN from the dataset and destroy the actual LUN on the
         storage system.
         """
@@ -470,6 +486,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
     def _lookup_lun_for_volume(self, name, project):
         """
         Lookup the LUN that corresponds to the give volume.
+
         Initial lookups involve a table scan of all of the discovered LUNs,
         but later lookups are done instantly from the hashtable.
         """
@@ -507,8 +524,9 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _get_host_details(self, host_id):
         """
-        Given the ID of a host (storage system), get the details about that
-        host.
+        Given the ID of a host, get the details about it.
+
+        A "host" is a storage system here.
         """
         server = self.client.service
         res = server.HostListInfoIterStart(ObjectNameOrId=host_id)
@@ -533,6 +551,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _api_elem_is_empty(self, elem):
         """
+        Return true if the API element should be considered empty.
+
         Helper routine to figure out if a list returned from a proxy API
         is empty. This is necessary because the API proxy produces nasty
         looking XML.
@@ -550,6 +570,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _get_target_portal_for_host(self, host_id, host_address):
         """
+        Get iSCSI target portal for a storage system.
+
         Get the iSCSI Target Portal details for a particular IP address
         on a storage system.
         """
@@ -573,6 +595,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _get_export(self, volume):
         """
+        Get the iSCSI export details for a volume.
+
         Looks up the LUN in DFM based on the volume and project name, then get
         the LUN's ID. We store that value in the database instead of the iSCSI
         details because we will not have the true iSCSI details until masking
@@ -584,19 +608,17 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         return {'provider_location': lun.id}
 
     def ensure_export(self, context, volume):
-        """
-        Driver entry point to get the iSCSI details about an existing volume.
-        """
+        """Driver entry point to get the export info for an existing volume."""
         return self._get_export(volume)
 
     def create_export(self, context, volume):
-        """
-        Driver entry point to get the iSCSI details about a new volume.
-        """
+        """Driver entry point to get the export info for a new volume."""
         return self._get_export(volume)
 
     def remove_export(self, context, volume):
         """
+        Driver exntry point to remove an export for a volume.
+
         Since exporting is idempotent in this driver, we have nothing
         to do for unexporting.
         """
@@ -604,6 +626,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _find_igroup_for_initiator(self, host_id, initiator_name):
         """
+        Get the igroup for an initiator.
+
         Look for an existing igroup (initiator group) on the storage system
         containing a given iSCSI initiator and return the name of the igroup.
         """
@@ -631,6 +655,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _create_igroup(self, host_id, initiator_name):
         """
+        Create a new igroup.
+
         Create a new igroup (initiator group) on the storage system to hold
         the given iSCSI initiator. The group will only have 1 member and will
         be named "openstack-${initiator_name}".
@@ -659,6 +685,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _get_lun_mappping(self, host_id, lunpath, igroup_name):
         """
+        Get the mapping between a LUN and an igroup.
+
         Check if a given LUN is already mapped to the given igroup (initiator
         group). If the LUN is mapped, also return the LUN number for the
         mapping.
@@ -680,6 +708,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _map_initiator(self, host_id, lunpath, igroup_name):
         """
+        Map a LUN to an igroup.
+
         Map the given LUN to the given igroup (initiator group). Return the LUN
         number that the LUN was mapped to (the filer will choose the lowest
         available number).
@@ -707,6 +737,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _ensure_initiator_mapped(self, host_id, lunpath, initiator_name):
         """
+        Ensure that a LUN is mapped to a particular initiator.
+
         Check if a LUN is mapped to a given initiator already and create
         the mapping if it is not. A new igroup will be created if needed.
         Returns the LUN number for the mapping between the LUN and initiator
@@ -724,6 +756,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _ensure_initiator_unmapped(self, host_id, lunpath, initiator_name):
         """
+        Ensure that a LUN is not mapped to a particular initiator.
+
         Check if a LUN is mapped to a given initiator and remove the
         mapping if it is. This does not destroy the igroup.
         """
@@ -738,6 +772,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def initialize_connection(self, volume, connector):
         """
+        Driver entry point to attach a volume to an instance.
+
         Do the LUN masking on the storage system so the initiator can access
         the LUN on the target. Also return the iSCSI properties so the
         initiator can find the LUN. This implementation does not call
@@ -789,6 +825,8 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def terminate_connection(self, volume, connector):
         """
+        Driver entry point to unattach a volume from an instance.
+
         Unmask the LUN on the storage system so the given intiator can no
         longer access it.
         """
@@ -803,8 +841,9 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _is_clone_done(self, host_id, clone_op_id, volume_uuid):
         """
-        Check the status of a clone operation. Return True if done, False
-        otherwise.
+        Check the status of a clone operation.
+
+        Return True if done, False otherwise.
         """
         request = self.client.factory.create('Request')
         request.Name = 'clone-list-status'
@@ -827,8 +866,9 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def _clone_lun(self, host_id, src_path, dest_path, snap):
         """
-        Create a clone of a NetApp LUN. The clone initially consumes no space
-        and is not space reserved.
+        Create a clone of a NetApp LUN.
+
+        The clone initially consumes no space and is not space reserved.
         """
         request = self.client.factory.create('Request')
         request.Name = 'clone-start'
@@ -904,8 +944,10 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def create_snapshot(self, snapshot):
         """
-        Driver entry point for creating a snapshot. This driver implements
-        snapshots by using efficient single-file (LUN) cloning.
+        Driver entry point for creating a snapshot.
+
+        This driver implements snapshots by using efficient single-file
+        (LUN) cloning.
         """
         vol_name = snapshot['volume_name']
         snapshot_name = snapshot['name']
@@ -941,8 +983,9 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """
-        Driver entry point for creating a new volume from a snapshot. Many
-        would call this "cloning" and in fact we use cloning to implement
+        Driver entry point for creating a new volume from a snapshot.
+
+        Many would call this "cloning" and in fact we use cloning to implement
         this feature.
         """
         vol_size = volume['size']

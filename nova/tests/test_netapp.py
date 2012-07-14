@@ -957,8 +957,9 @@ class NetAppDriverTestCase(test.TestCase):
         super(NetAppDriverTestCase, self).setUp()
         driver = netapp.NetAppISCSIDriver()
         self.stubs.Set(httplib, 'HTTPConnection', FakeHTTPConnection)
-        driver._create_client('http://localhost:8088/dfm.wsdl', False,
-                              'root', 'password', 'localhost', 8088)
+        driver._create_client(wsdl_url='http://localhost:8088/dfm.wsdl',
+                              login='root', password='password',
+                              hostname='localhost', port=8088, cache=False)
         driver._set_storage_service(self.STORAGE_SERVICE)
         driver._set_storage_service_prefix(self.STORAGE_SERVICE_PREFIX)
         driver._set_vfiler('')
