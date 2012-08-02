@@ -129,6 +129,9 @@ class NovaException(Exception):
 
     """
     message = _("An unknown exception occurred.")
+    code = 500
+    headers = {}
+    safe = False
 
     def __init__(self, message=None, **kwargs):
         self.kwargs = kwargs
@@ -197,7 +200,8 @@ class VirtualInterfaceMacAddressException(NovaException):
 
 
 class GlanceConnectionFailed(NovaException):
-    message = _("Connection to glance failed") + ": %(reason)s"
+    message = _("Connection to glance host %(host)s:%(port)s failed: "
+        "%(reason)s")
 
 
 class MelangeConnectionFailed(NovaException):
@@ -420,7 +424,7 @@ class InvalidEc2Id(Invalid):
 
 
 class InvalidUUID(Invalid):
-    message = _("Expected a uuid but received %(uuid).")
+    message = _("Expected a uuid but received %(uuid)s.")
 
 
 class ConstraintNotMet(NovaException):
@@ -593,7 +597,7 @@ class FixedIpNotFoundForAddress(FixedIpNotFound):
 
 
 class FixedIpNotFoundForInstance(FixedIpNotFound):
-    message = _("Instance %(instance_id)s has zero fixed ips.")
+    message = _("Instance %(instance_uuid)s has zero fixed ips.")
 
 
 class FixedIpNotFoundForNetworkHost(FixedIpNotFound):
@@ -602,7 +606,7 @@ class FixedIpNotFoundForNetworkHost(FixedIpNotFound):
 
 
 class FixedIpNotFoundForSpecificInstance(FixedIpNotFound):
-    message = _("Instance %(instance_id)s doesn't have fixed ip '%(ip)s'.")
+    message = _("Instance %(instance_uuid)s doesn't have fixed ip '%(ip)s'.")
 
 
 class FixedIpNotFoundForHost(FixedIpNotFound):
@@ -615,7 +619,8 @@ class FixedIpNotFoundForNetwork(FixedIpNotFound):
 
 
 class FixedIpAlreadyInUse(NovaException):
-    message = _("Fixed IP address %(address)s is already in use.")
+    message = _("Fixed IP address %(address)s is already in use on instance "
+                "%(instance_uuid)s.")
 
 
 class FixedIpInvalid(Invalid):
@@ -648,6 +653,7 @@ class FloatingIpNotFoundForHost(FloatingIpNotFound):
 
 class NoMoreFloatingIps(FloatingIpNotFound):
     message = _("Zero floating ips available.")
+    safe = True
 
 
 class FloatingIpAssociated(NovaException):
@@ -994,6 +1000,9 @@ class WillNotSchedule(NovaException):
 
 class QuotaError(NovaException):
     message = _("Quota exceeded") + ": code=%(code)s"
+    code = 413
+    headers = {'Retry-After': 0}
+    safe = True
 
 
 class TooManyInstances(QuotaError):
@@ -1033,6 +1042,10 @@ class KeypairLimitExceeded(QuotaError):
     message = _("Maximum number of key pairs exceeded")
 
 
+class SecurityGroupLimitExceeded(QuotaError):
+    message = _("Maximum number of security groups or rules exceeded")
+
+
 class AggregateError(NovaException):
     message = _("Aggregate %(aggregate_id)s: action '%(action)s' "
                 "caused an error: %(reason)s.")
@@ -1055,10 +1068,6 @@ class AggregateMetadataNotFound(NotFound):
                 "key %(metadata_key)s.")
 
 
-class AggregateHostConflict(Duplicate):
-    message = _("Host %(host)s already member of another aggregate.")
-
-
 class AggregateHostExists(Duplicate):
     message = _("Aggregate %(aggregate_id)s already has host %(host)s.")
 
@@ -1074,6 +1083,12 @@ class VolumeTypeCreateFailed(NovaException):
 
 class InstanceTypeCreateFailed(NovaException):
     message = _("Unable to create instance type")
+
+
+class InstancePasswordSetFailed(NovaException):
+    message = _("Failed to set admin password on %(instance)s "
+                "because %(reason)s")
+    safe = True
 
 
 class SolidFireAPIException(NovaException):

@@ -30,4 +30,5 @@ class ExtensionManager(base_extensions.ExtensionManager):
 
         self.cls_list = FLAGS.osapi_volume_extension
         self.extensions = {}
+        self.plugins = []
         self._load_extensions()

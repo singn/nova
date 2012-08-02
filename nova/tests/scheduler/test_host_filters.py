@@ -338,6 +338,17 @@ class HostFiltersTestCase(test.TestCase):
                  'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
+    def test_compute_filter_fails_on_capability_disabled(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['ComputeFilter']()
+        filter_properties = {'instance_type': {'memory_mb': 1024}}
+        capabilities = {'enabled': False}
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'compute',
+                {'free_ram_mb': 1024, 'capabilities': capabilities,
+                 'service': service})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
     def test_compute_filter_passes_on_volume(self):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['ComputeFilter']()
@@ -362,7 +373,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_compute_filter_passes_extra_specs(self):
         self._stub_service_is_up(True)
-        filt_cls = self.class_map['ComputeFilter']()
+        filt_cls = self.class_map['ComputeCapabilitiesFilter']()
         extra_specs = {'opt1': 1, 'opt2': 2}
         capabilities = {'enabled': True, 'opt1': 1, 'opt2': 2}
         service = {'disabled': False}
@@ -375,7 +386,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_compute_filter_fails_extra_specs(self):
         self._stub_service_is_up(True)
-        filt_cls = self.class_map['ComputeFilter']()
+        filt_cls = self.class_map['ComputeCapabilitiesFilter']()
         extra_specs = {'opt1': 1, 'opt2': 3}
         capabilities = {'enabled': True, 'opt1': 1, 'opt2': 2}
         service = {'disabled': False}
@@ -555,7 +566,7 @@ class HostFiltersTestCase(test.TestCase):
                  'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
-        # Failes due to caps disabled
+        # Fails due to capabilities being disabled
         capabilities = {'enabled': False, 'opt1': 'match'}
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'instance_type',
@@ -884,4 +895,27 @@ class HostFiltersTestCase(test.TestCase):
         service = {'disabled': False}
         host = fakes.FakeHostState('host1', 'compute',
             {'capabilities': capabilities, 'service': service})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_retry_filter_disabled(self):
+        """Test case where retry/re-scheduling is disabled"""
+        filt_cls = self.class_map['RetryFilter']()
+        host = fakes.FakeHostState('host1', 'compute', {})
+        filter_properties = {}
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_retry_filter_pass(self):
+        """Host not previously tried"""
+        filt_cls = self.class_map['RetryFilter']()
+        host = fakes.FakeHostState('host1', 'compute', {})
+        retry = dict(num_attempts=1, hosts=['host2', 'host3'])
+        filter_properties = dict(retry=retry)
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_retry_filter_fail(self):
+        """Host was already tried"""
+        filt_cls = self.class_map['RetryFilter']()
+        host = fakes.FakeHostState('host1', 'compute', {})
+        retry = dict(num_attempts=1, hosts=['host3', 'host1'])
+        filter_properties = dict(retry=retry)
         self.assertFalse(filt_cls.host_passes(host, filter_properties))

@@ -28,7 +28,6 @@ Includes injection of SSH PGP keys into authorized_keys file.
 import crypt
 import os
 import random
-import re
 import tempfile
 
 from nova import exception
@@ -40,6 +39,7 @@ from nova import utils
 from nova.virt.disk import guestfs
 from nova.virt.disk import loop
 from nova.virt.disk import nbd
+from nova.virt import images
 
 
 LOG = logging.getLogger(__name__)
@@ -91,10 +91,6 @@ for s in FLAGS.virt_mkfs:
         _DEFAULT_MKFS_COMMAND = mkfs_command
 
 
-_QEMU_VIRT_SIZE_REGEX = re.compile('^virtual size: (.*) \(([0-9]+) bytes\)',
-                                   re.MULTILINE)
-
-
 def mkfs(os_type, fs_label, target):
     mkfs_command = (_MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND) or
                     '') % locals()
@@ -102,26 +98,56 @@ def mkfs(os_type, fs_label, target):
         utils.execute(*mkfs_command.split())
 
 
-def get_image_virtual_size(image):
-    out, _err = utils.execute('qemu-img', 'info', image)
-    m = _QEMU_VIRT_SIZE_REGEX.search(out)
-    return int(m.group(2))
-
-
 def resize2fs(image, check_exit_code=False):
     utils.execute('e2fsck', '-fp', image, check_exit_code=check_exit_code)
     utils.execute('resize2fs', image, check_exit_code=check_exit_code)
 
 
+def get_disk_size(path):
+    """Get the (virtual) size of a disk image
+
+    :param path: Path to the disk image
+    :returns: Size (in bytes) of the given disk image as it would be seen
+              by a virtual machine.
+    """
+    size = images.qemu_img_info(path)['virtual size']
+    size = size.split('(')[1].split()[0]
+    return int(size)
+
+
 def extend(image, size):
     """Increase image to size"""
-    # NOTE(MotoKen): check image virtual size before resize
-    virt_size = get_image_virtual_size(image)
+    virt_size = get_disk_size(image)
     if virt_size >= size:
         return
     utils.execute('qemu-img', 'resize', image, size)
     # NOTE(vish): attempts to resize filesystem
     resize2fs(image)
+
+
+def can_resize_fs(image, size, use_cow=False):
+    """Check whether we can resize contained file system."""
+
+    # Check that we're increasing the size
+    virt_size = get_disk_size(image)
+    if virt_size >= size:
+        return False
+
+    # Check the image is unpartitioned
+    if use_cow:
+        # Try to mount an unpartitioned qcow2 image
+        try:
+            inject_data(image, use_cow=True)
+        except exception.NovaException:
+            return False
+    else:
+        # For raw, we can directly inspect the file system
+        try:
+            utils.execute('e2label', image)
+        except exception.ProcessExecutionError:
+            return False
+
+    return True
 
 
 def bind(src, target, instance_name):
@@ -336,6 +362,37 @@ def _inject_metadata_into_fs(metadata, fs):
     _inject_file_into_fs(fs, 'meta.js', jsonutils.dumps(metadata))
 
 
+def _setup_selinux_for_keys(fs):
+    """Get selinux guests to ensure correct context on injected keys."""
+
+    se_cfg = _join_and_check_path_within_fs(fs, 'etc', 'selinux')
+    se_cfg, _err = utils.trycmd('readlink', '-e', se_cfg, run_as_root=True)
+    if not se_cfg:
+        return
+
+    rclocal = _join_and_check_path_within_fs(fs, 'etc', 'rc.local')
+
+    # Support systemd based systems
+    rc_d = _join_and_check_path_within_fs(fs, 'etc', 'rc.d')
+    rclocal_e, _err = utils.trycmd('readlink', '-e', rclocal, run_as_root=True)
+    rc_d_e, _err = utils.trycmd('readlink', '-e', rc_d, run_as_root=True)
+    if not rclocal_e and rc_d_e:
+        rclocal = os.path.join(rc_d, 'rc.local')
+
+    # Note some systems end rc.local with "exit 0"
+    # and so to append there you'd need something like:
+    #  utils.execute('sed', '-i', '${/^exit 0$/d}' rclocal, run_as_root=True)
+    restorecon = [
+        '#!/bin/sh\n',
+        '# Added by Nova to ensure injected ssh keys have the right context\n',
+        'restorecon -RF /root/.ssh/ 2>/dev/null || :\n',
+    ]
+
+    rclocal_rel = os.path.relpath(rclocal, fs)
+    _inject_file_into_fs(fs, rclocal_rel, ''.join(restorecon), append=True)
+    utils.execute('chmod', 'a+x', rclocal, run_as_root=True)
+
+
 def _inject_key_into_fs(key, fs):
     """Add the given public ssh key to root's authorized_keys.
 
@@ -358,6 +415,8 @@ def _inject_key_into_fs(key, fs):
     ])
 
     _inject_file_into_fs(fs, keyfile, key_data, append=True)
+
+    _setup_selinux_for_keys(fs)
 
 
 def _inject_net_into_fs(net, fs):

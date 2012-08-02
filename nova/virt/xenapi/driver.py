@@ -65,23 +65,23 @@ xenapi_opts = [
     cfg.StrOpt('xenapi_connection_url',
                default=None,
                help='URL for connection to XenServer/Xen Cloud Platform. '
-                    'Required if connection_type=xenapi.'),
+                    'Required if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('xenapi_connection_username',
                default='root',
                help='Username for connection to XenServer/Xen Cloud Platform. '
-                    'Used only if connection_type=xenapi.'),
+                    'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('xenapi_connection_password',
                default=None,
                help='Password for connection to XenServer/Xen Cloud Platform. '
-                    'Used only if connection_type=xenapi.'),
+                    'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.IntOpt('xenapi_connection_concurrent',
                default=5,
                help='Maximum number of concurrent XenAPI connections. '
-                    'Used only if connection_type=xenapi.'),
+                    'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.FloatOpt('xenapi_vhd_coalesce_poll_interval',
                  default=5.0,
                  help='The interval used for polling of coalescing vhds. '
-                      'Used only if connection_type=xenapi.'),
+                      'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.BoolOpt('xenapi_check_host',
                 default=True,
                 help='Ensure compute service is running on host XenAPI '
@@ -89,13 +89,14 @@ xenapi_opts = [
     cfg.IntOpt('xenapi_vhd_coalesce_max_attempts',
                default=5,
                help='Max number of times to poll for VHD to coalesce. '
-                    'Used only if connection_type=xenapi.'),
+                    'Used only if compute_driver=xenapi.XenAPIDriver'),
     cfg.StrOpt('xenapi_agent_path',
                default='usr/sbin/xe-update-networking',
                help='Specifies the path in which the xenapi guest agent '
                     'should be located. If the agent is present, network '
                     'configuration is not injected into the image. '
-                    'Used if connection_type=xenapi and flat_injected=True'),
+                    'Used if compute_driver=xenapi.XenAPIDriver and '
+                    ' flat_injected=True'),
     cfg.StrOpt('xenapi_sr_base_path',
                default='/var/run/sr-mount',
                help='Base path to the storage repository'),
@@ -140,7 +141,7 @@ class XenAPIDriver(driver.ComputeDriver):
             raise Exception(_('Must specify xenapi_connection_url, '
                               'xenapi_connection_username (optionally), and '
                               'xenapi_connection_password to use '
-                              'connection_type=xenapi'))
+                              'compute_driver=xenapi.XenAPIDriver'))
 
         self._session = XenAPISession(url, username, password)
         self._volumeops = volumeops.VolumeOps(self._session)
@@ -212,6 +213,10 @@ class XenAPIDriver(driver.ComputeDriver):
         should be base64-encoded.
         """
         self._vmops.inject_file(instance, b64_path, b64_contents)
+
+    def change_instance_metadata(self, context, instance, diff):
+        """Apply a diff to the instance metadata."""
+        self._vmops.change_instance_metadata(instance, diff)
 
     def destroy(self, instance, network_info, block_device_info=None):
         """Destroy VM instance"""
@@ -410,22 +415,91 @@ class XenAPIDriver(driver.ComputeDriver):
             LOG.info(_('Compute_service record updated for %s ') % host)
             db.compute_node_update(ctxt, compute_node_ref[0]['id'], dic)
 
-    def compare_cpu(self, xml):
-        """This method is supported only by libvirt."""
-        raise NotImplementedError('This method is supported only by libvirt.')
-
     def ensure_filtering_rules_for_instance(self, instance_ref, network_info):
-        """This method is supported only libvirt."""
         # NOTE(salvatore-orlando): it enforces security groups on
         # host initialization and live migration.
-        # Live migration is not supported by XenAPI (as of 2011-11-09)
         # In XenAPI we do not assume instances running upon host initialization
         return
 
-    def live_migration(self, context, instance_ref, dest,
+    def check_can_live_migrate_destination(self, ctxt, instance_ref,
+                block_migration=False, disk_over_commit=False):
+        """Check if it is possible to execute live migration.
+
+        :param context: security context
+        :param instance_ref: nova.db.sqlalchemy.models.Instance object
+        :param block_migration: if true, prepare for block migration
+        :param disk_over_commit: if true, allow disk over commit
+
+        """
+        self._vmops.check_can_live_migrate_destination(ctxt, instance_ref,
+                block_migration, disk_over_commit)
+
+    def check_can_live_migrate_destination_cleanup(self, ctxt,
+                                                   dest_check_data):
+        """Do required cleanup on dest host after check_can_live_migrate calls
+
+        :param ctxt: security context
+        :param disk_over_commit: if true, allow disk over commit
+        """
+        pass
+
+    def check_can_live_migrate_source(self, ctxt, instance_ref,
+                                      dest_check_data):
+        """Check if it is possible to execute live migration.
+
+        This checks if the live migration can succeed, based on the
+        results from check_can_live_migrate_destination.
+
+        :param context: security context
+        :param instance_ref: nova.db.sqlalchemy.models.Instance
+        :param dest_check_data: result of check_can_live_migrate_destination
+        """
+        pass
+
+    def live_migration(self, ctxt, instance_ref, dest,
                        post_method, recover_method, block_migration=False):
-        """This method is supported only by libvirt."""
-        return
+        """Performs the live migration of the specified instance.
+
+        :params ctxt: security context
+        :params instance_ref:
+            nova.db.sqlalchemy.models.Instance object
+            instance object that is migrated.
+        :params dest: destination host
+        :params post_method:
+            post operation method.
+            expected nova.compute.manager.post_live_migration.
+        :params recover_method:
+            recovery method when any exception occurs.
+            expected nova.compute.manager.recover_live_migration.
+        :params block_migration: if true, migrate VM disk.
+        """
+        self._vmops.live_migrate(ctxt, instance_ref, dest, post_method,
+                                 recover_method, block_migration)
+
+    def pre_live_migration(self, context, instance_ref, block_device_info,
+                           network_info):
+        """Preparation live migration.
+
+        :params block_device_info:
+            It must be the result of _get_instance_volume_bdms()
+            at compute manager.
+        """
+        # TODO(JohnGarbutt) look again when boot-from-volume hits trunk
+        pass
+
+    def post_live_migration_at_destination(self, ctxt, instance_ref,
+                                           network_info, block_migration):
+        """Post operation of live migration at destination host.
+
+        :params ctxt: security context
+        :params instance_ref:
+            nova.db.sqlalchemy.models.Instance object
+            instance object that is migrated.
+        :params network_info: instance network infomation
+        :params : block_migration: if true, post operation of block_migraiton.
+        """
+        # TODO(JohnGarbutt) look at moving/downloading ramdisk and kernel
+        pass
 
     def unfilter_instance(self, instance_ref, network_info):
         """Removes security groups configured for an instance."""
@@ -493,6 +567,12 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._pool.remove_from_aggregate(context,
                                                 aggregate, host, **kwargs)
 
+    def undo_aggregate_operation(self, context, op, aggregate_id,
+                                  host, set_error=True):
+        """Undo aggregate operation when pool error raised"""
+        return self._pool.undo_aggregate_operation(context, op,
+                aggregate_id, host, set_error)
+
     def legacy_nwinfo(self):
         """
         Indicate if the driver requires the legacy network_info format.
@@ -514,7 +594,8 @@ class XenAPISession(object):
         url = self._create_first_session(url, user, pw, exception)
         self._populate_session_pool(url, user, pw, exception)
         self.host_uuid = self._get_host_uuid()
-        self.product_version = self._get_product_version()
+        self.product_version, self.product_brand = \
+            self._get_product_version_and_brand()
 
     def _create_first_session(self, url, user, pw, exception):
         try:
@@ -556,13 +637,16 @@ class XenAPISession(object):
                 host_ref = session.xenapi.session.get_this_host(session.handle)
                 return session.xenapi.host.get_uuid(host_ref)
 
-    def _get_product_version(self):
-        """Return a tuple of (major, minor, rev) for the host version"""
+    def _get_product_version_and_brand(self):
+        """Return a tuple of (major, minor, rev) for the host version and
+        a string of the product brand"""
         host = self.get_xenapi_host()
         software_version = self.call_xenapi('host.get_software_version',
                                             host)
-        product_version = software_version['product_version']
-        return tuple(int(part) for part in product_version.split('.'))
+        product_version = tuple(int(part) for part in
+                                software_version['product_version'].split('.'))
+        product_brand = software_version['product_brand']
+        return product_version, product_brand
 
     def get_session_id(self):
         """Return a string session_id.  Used for vnc consoles."""

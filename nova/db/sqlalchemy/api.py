@@ -26,7 +26,6 @@ import re
 import warnings
 
 from nova import block_device
-from nova.compute import aggregate_states
 from nova.compute import vm_states
 from nova import db
 from nova.db.sqlalchemy import models
@@ -283,7 +282,6 @@ class Constraint(object):
         self.conditions = conditions
 
     def apply(self, model, query):
-        clauses = []
         for key, condition in self.conditions.iteritems():
             for clause in condition.clauses(getattr(model, key)):
                 query = query.filter(clause)
@@ -632,6 +630,31 @@ def compute_node_utilization_set(context, host, free_ram_mb=None,
     return compute_node
 
 
+def compute_node_statistics(context):
+    """Compute statistics over all compute nodes."""
+    result = model_query(context,
+                         func.count(models.ComputeNode.id),
+                         func.sum(models.ComputeNode.vcpus),
+                         func.sum(models.ComputeNode.memory_mb),
+                         func.sum(models.ComputeNode.local_gb),
+                         func.sum(models.ComputeNode.vcpus_used),
+                         func.sum(models.ComputeNode.memory_mb_used),
+                         func.sum(models.ComputeNode.local_gb_used),
+                         func.sum(models.ComputeNode.free_ram_mb),
+                         func.sum(models.ComputeNode.free_disk_gb),
+                         func.sum(models.ComputeNode.current_workload),
+                         func.sum(models.ComputeNode.running_vms),
+                         func.sum(models.ComputeNode.disk_available_least),
+                         read_deleted="no").first()
+
+    # Build a dict of the info--making no assumptions about result
+    fields = ('count', 'vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+              'memory_mb_used', 'local_gb_used', 'free_ram_mb', 'free_disk_gb',
+              'current_workload', 'running_vms', 'disk_available_least')
+    return dict((field, int(result[idx] or 0))
+                for idx, field in enumerate(fields))
+
+
 ###################
 
 
@@ -697,7 +720,7 @@ def floating_ip_get(context, id):
 def floating_ip_get_pools(context):
     session = get_session()
     pools = []
-    for result in session.query(models.FloatingIp.pool).distinct():
+    for result in model_query(context, models.FloatingIp.pool).distinct():
         pools.append({'name': result[0]})
     return pools
 
@@ -958,7 +981,7 @@ def dnsdomain_list(context):
     session = get_session()
     records = model_query(context, models.DNSDomain,
                   session=session, read_deleted="no").\
-                  with_lockmode('update').all()
+                  all()
     domains = []
     for record in records:
         domains.append(record.domain)
@@ -970,12 +993,15 @@ def dnsdomain_list(context):
 
 
 @require_admin_context
-def fixed_ip_associate(context, address, instance_id, network_id=None,
+def fixed_ip_associate(context, address, instance_uuid, network_id=None,
                        reserved=False):
     """Keyword arguments:
     reserved -- should be a boolean value(True or False), exact value will be
     used to filter on the fixed ip address
     """
+    if not utils.is_uuid_like(instance_uuid):
+        raise exception.InvalidUUID(uuid=instance_uuid)
+
     session = get_session()
     with session.begin():
         network_or_none = or_(models.FixedIp.network_id == network_id,
@@ -992,18 +1018,22 @@ def fixed_ip_associate(context, address, instance_id, network_id=None,
         if fixed_ip_ref is None:
             raise exception.FixedIpNotFoundForNetwork(address=address,
                                             network_id=network_id)
-        if fixed_ip_ref.instance_id:
+        if fixed_ip_ref.instance_uuid:
             raise exception.FixedIpAlreadyInUse(address=address)
 
         if not fixed_ip_ref.network_id:
             fixed_ip_ref.network_id = network_id
-        fixed_ip_ref.instance_id = instance_id
+        fixed_ip_ref.instance_uuid = instance_uuid
         session.add(fixed_ip_ref)
     return fixed_ip_ref['address']
 
 
 @require_admin_context
-def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
+def fixed_ip_associate_pool(context, network_id, instance_uuid=None,
+                            host=None):
+    if instance_uuid and not utils.is_uuid_like(instance_uuid):
+        raise exception.InvalidUUID(uuid=instance_uuid)
+
     session = get_session()
     with session.begin():
         network_or_none = or_(models.FixedIp.network_id == network_id,
@@ -1012,7 +1042,7 @@ def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
                                    read_deleted="no").\
                                filter(network_or_none).\
                                filter_by(reserved=False).\
-                               filter_by(instance_id=None).\
+                               filter_by(instance_uuid=None).\
                                filter_by(host=None).\
                                with_lockmode('update').\
                                first()
@@ -1024,8 +1054,8 @@ def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
         if fixed_ip_ref['network_id'] is None:
             fixed_ip_ref['network'] = network_id
 
-        if instance_id:
-            fixed_ip_ref['instance_id'] = instance_id
+        if instance_uuid:
+            fixed_ip_ref['instance_uuid'] = instance_uuid
 
         if host:
             fixed_ip_ref['host'] = host
@@ -1058,7 +1088,7 @@ def fixed_ip_disassociate(context, address):
         fixed_ip_ref = fixed_ip_get_by_address(context,
                                                address,
                                                session=session)
-        fixed_ip_ref['instance_id'] = None
+        fixed_ip_ref['instance_uuid'] = None
         fixed_ip_ref.save(session=session)
 
 
@@ -1079,7 +1109,8 @@ def fixed_ip_disassociate_all_by_timeout(context, host, time):
                      join((models.Network,
                            models.Network.id == models.FixedIp.network_id)).\
                      join((models.Instance,
-                           models.Instance.id == models.FixedIp.instance_id)).\
+                           models.Instance.uuid == \
+                               models.FixedIp.instance_uuid)).\
                      filter(host_filter).\
                      all()
     fixed_ip_ids = [fip[0] for fip in result]
@@ -1087,7 +1118,7 @@ def fixed_ip_disassociate_all_by_timeout(context, host, time):
         return 0
     result = model_query(context, models.FixedIp, session=session).\
                      filter(models.FixedIp.id.in_(fixed_ip_ids)).\
-                     update({'instance_id': None,
+                     update({'instance_uuid': None,
                              'leased': False,
                              'updated_at': timeutils.utcnow()},
                              synchronize_session='fetch')
@@ -1104,8 +1135,9 @@ def fixed_ip_get(context, id, session=None):
 
     # FIXME(sirp): shouldn't we just use project_only here to restrict the
     # results?
-    if is_user_context(context) and result['instance_id'] is not None:
-        instance = instance_get(context, result['instance_id'], session)
+    if is_user_context(context) and result['instance_uuid'] is not None:
+        instance = instance_get_by_uuid(context, result['instance_uuid'],
+                                        session)
         authorize_project_context(context, instance.project_id)
 
     return result
@@ -1132,21 +1164,25 @@ def fixed_ip_get_by_address(context, address, session=None):
 
     # NOTE(sirp): shouldn't we just use project_only here to restrict the
     # results?
-    if is_user_context(context) and result['instance_id'] is not None:
-        instance = instance_get(context, result['instance_id'], session)
+    if is_user_context(context) and result['instance_uuid'] is not None:
+        instance = instance_get_by_uuid(context, result['instance_uuid'],
+                                        session)
         authorize_project_context(context, instance.project_id)
 
     return result
 
 
 @require_context
-def fixed_ip_get_by_instance(context, instance_id):
+def fixed_ip_get_by_instance(context, instance_uuid):
+    if not utils.is_uuid_like(instance_uuid):
+        raise exception.InvalidUUID(uuid=instance_uuid)
+
     result = model_query(context, models.FixedIp, read_deleted="no").\
-                 filter_by(instance_id=instance_id).\
+                 filter_by(instance_uuid=instance_uuid).\
                  all()
 
     if not result:
-        raise exception.FixedIpNotFoundForInstance(instance_id=instance_id)
+        raise exception.FixedIpNotFoundForInstance(instance_uuid=instance_uuid)
 
     return result
 
@@ -1252,24 +1288,24 @@ def virtual_interface_get_by_uuid(context, vif_uuid):
 
 
 @require_context
-@require_instance_exists
-def virtual_interface_get_by_instance(context, instance_id):
+@require_instance_exists_using_uuid
+def virtual_interface_get_by_instance(context, instance_uuid):
     """Gets all virtual interfaces for instance.
 
-    :param instance_id: = id of the instance to retrieve vifs for
+    :param instance_uuid: = uuid of the instance to retrieve vifs for
     """
     vif_refs = _virtual_interface_query(context).\
-                       filter_by(instance_id=instance_id).\
+                       filter_by(instance_uuid=instance_uuid).\
                        all()
     return vif_refs
 
 
 @require_context
-def virtual_interface_get_by_instance_and_network(context, instance_id,
-                                                           network_id):
+def virtual_interface_get_by_instance_and_network(context, instance_uuid,
+                                                  network_id):
     """Gets virtual interface for instance that's associated with network."""
     vif_ref = _virtual_interface_query(context).\
-                      filter_by(instance_id=instance_id).\
+                      filter_by(instance_uuid=instance_uuid).\
                       filter_by(network_id=network_id).\
                       first()
     return vif_ref
@@ -1288,13 +1324,13 @@ def virtual_interface_delete(context, vif_id):
 
 
 @require_context
-def virtual_interface_delete_by_instance(context, instance_id):
+def virtual_interface_delete_by_instance(context, instance_uuid):
     """Delete virtual interface records that are associated
     with the instance given by instance_id.
 
-    :param instance_id: = id of instance
+    :param instance_uuid: = uuid of instance
     """
-    vif_refs = virtual_interface_get_by_instance(context, instance_id)
+    vif_refs = virtual_interface_get_by_instance(context, instance_uuid)
     for vif_ref in vif_refs:
         virtual_interface_delete(context, vif_ref['id'])
 
@@ -1485,7 +1521,7 @@ def instance_get_all_by_filters(context, filters, sort_key, sort_dir):
             v = getattr(instance, filter_name)
         except AttributeError:
             return True
-        if v and filter_re.match(str(v)):
+        if v and filter_re.match(unicode(v)):
             return True
         return False
 
@@ -1530,7 +1566,7 @@ def instance_get_all_by_filters(context, filters, sort_key, sort_dir):
     # Filters for exact matches that we can do along with the SQL query...
     # For other filters that don't match this, we will do regexp matching
     exact_match_filter_names = ['project_id', 'user_id', 'image_ref',
-            'vm_state', 'instance_type_id', 'uuid']
+                                'vm_state', 'instance_type_id', 'uuid']
 
     # Filter the query
     query_prefix = exact_filter(query_prefix, models.Instance,
@@ -1647,9 +1683,12 @@ def instance_get_all_by_reservation(context, reservation_id):
 #                go away
 @require_context
 def instance_get_floating_address(context, instance_id):
-    fixed_ips = fixed_ip_get_by_instance(context, instance_id)
+    instance = instance_get(context, instance_id)
+    fixed_ips = fixed_ip_get_by_instance(context, instance['uuid'])
+
     if not fixed_ips:
         return None
+
     # NOTE(tr3buchet): this only gets the first fixed_ip
     # won't find floating ips associated with other fixed_ips
     floating_ips = floating_ip_get_by_fixed_address(context,
@@ -1850,8 +1889,11 @@ def instance_info_cache_update(context, instance_uuid, values,
     session = session or get_session()
     info_cache = instance_info_cache_get(context, instance_uuid,
                                          session=session)
-
     if info_cache:
+        # NOTE(tr3buchet): let's leave it alone if it's already deleted
+        if info_cache['deleted']:
+            return info_cache
+
         info_cache.update(values)
         info_cache.save(session=session)
     else:
@@ -1940,20 +1982,12 @@ def key_pair_count_by_user(context, user_id):
 
 
 @require_admin_context
-def network_associate(context, project_id, force=False):
+def network_associate(context, project_id):
     """Associate a project with a network.
 
     called by project_get_networks under certain conditions
-    and network manager add_network_to_project()
 
     only associate if the project doesn't already have a network
-    or if force is True
-
-    force solves race condition where a fresh project has multiple instance
-    builds simultaneously picked up by multiple network hosts which attempt
-    to associate the project with multiple networks
-    force should only be used as a direct consequence of user request
-    all automated requests should not use force
     """
     session = get_session()
     with session.begin():
@@ -1965,13 +1999,10 @@ def network_associate(context, project_id, force=False):
                            with_lockmode('update').\
                            first()
 
-        if not force:
-            # find out if project has a network
-            network_ref = network_query(project_id)
-
-        if force or not network_ref:
-            # in force mode or project doesn't have a network so associate
-            # with a new network
+        # find out if project has a network
+        network_ref = network_query(project_id)
+        if not network_ref:
+            # project doesn't have a network so associate with a new network
 
             # get new network
             network_ref = network_query(None)
@@ -2123,11 +2154,11 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
     vif_and = and_(models.VirtualInterface.id ==
                    models.FixedIp.virtual_interface_id,
                    models.VirtualInterface.deleted == False)
-    inst_and = and_(models.Instance.id == models.FixedIp.instance_id,
+    inst_and = and_(models.Instance.uuid == models.FixedIp.instance_uuid,
                     models.Instance.deleted == False)
     session = get_session()
     query = session.query(models.FixedIp.address,
-                          models.FixedIp.instance_id,
+                          models.FixedIp.instance_uuid,
                           models.FixedIp.network_id,
                           models.FixedIp.virtual_interface_id,
                           models.VirtualInterface.address,
@@ -2139,7 +2170,7 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
                           filter(models.FixedIp.allocated == True).\
                           join((models.VirtualInterface, vif_and)).\
                           join((models.Instance, inst_and)).\
-                          filter(models.FixedIp.instance_id != None).\
+                          filter(models.FixedIp.instance_uuid != None).\
                           filter(models.FixedIp.virtual_interface_id != None)
     if host:
         query = query.filter(models.Instance.host == host)
@@ -2148,7 +2179,7 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
     for datum in result:
         cleaned = {}
         cleaned['address'] = datum[0]
-        cleaned['instance_id'] = datum[1]
+        cleaned['instance_uuid'] = datum[1]
         cleaned['network_id'] = datum[2]
         cleaned['vif_id'] = datum[3]
         cleaned['vif_address'] = datum[4]
@@ -2460,18 +2491,14 @@ def quota_usage_get_all_by_project(context, project_id):
 
 @require_admin_context
 def quota_usage_create(context, project_id, resource, in_use, reserved,
-                       until_refresh, session=None, save=True):
+                       until_refresh, session=None):
     quota_usage_ref = models.QuotaUsage()
     quota_usage_ref.project_id = project_id
     quota_usage_ref.resource = resource
     quota_usage_ref.in_use = in_use
     quota_usage_ref.reserved = reserved
     quota_usage_ref.until_refresh = until_refresh
-
-    # Allow us to hold the save operation until later; keeps the
-    # transaction in quota_reserve() from breaking too early
-    if save:
-        quota_usage_ref.save(session=session)
+    quota_usage_ref.save(session=session)
 
     return quota_usage_ref
 
@@ -2542,7 +2569,7 @@ def reservation_create(context, uuid, usage, project_id, resource, delta,
                        expire, session=None):
     reservation_ref = models.Reservation()
     reservation_ref.uuid = uuid
-    reservation_ref.usage = usage
+    reservation_ref.usage_id = usage['id']
     reservation_ref.project_id = project_id
     reservation_ref.resource = resource
     reservation_ref.delta = delta
@@ -2562,13 +2589,17 @@ def reservation_destroy(context, uuid):
 ###################
 
 
-def _get_quota_usages(context, session, keys):
+# NOTE(johannes): The quota code uses SQL locking to ensure races don't
+# cause under or over counting of resources. To avoid deadlocks, this
+# code always acquires the lock on quota_usages before acquiring the lock
+# on reservations.
+
+def _get_quota_usages(context, session):
     # Broken out for testability
     rows = model_query(context, models.QuotaUsage,
                        read_deleted="no",
                        session=session).\
                    filter_by(project_id=context.project_id).\
-                   filter(models.QuotaUsage.resource.in_(keys)).\
                    with_lockmode('update').\
                    all()
     return dict((row.resource, row) for row in rows)
@@ -2581,7 +2612,7 @@ def quota_reserve(context, resources, quotas, deltas, expire,
     session = get_session()
     with session.begin():
         # Get the current usages
-        usages = _get_quota_usages(context, session, deltas.keys())
+        usages = _get_quota_usages(context, session)
 
         # Handle usage refresh
         work = set(deltas.keys())
@@ -2591,14 +2622,12 @@ def quota_reserve(context, resources, quotas, deltas, expire,
             # Do we need to refresh the usage?
             refresh = False
             if resource not in usages:
-                # Note we're inhibiting save...
                 usages[resource] = quota_usage_create(elevated,
                                                       context.project_id,
                                                       resource,
                                                       0, 0,
                                                       until_refresh or None,
-                                                      session=session,
-                                                      save=False)
+                                                      session=session)
                 refresh = True
             elif usages[resource].in_use < 0:
                 # Negative in_use count indicates a desync, so try to
@@ -2621,14 +2650,12 @@ def quota_reserve(context, resources, quotas, deltas, expire,
                 for res, in_use in updates.items():
                     # Make sure we have a destination for the usage!
                     if res not in usages:
-                        # Note we're inhibiting save...
                         usages[res] = quota_usage_create(elevated,
                                                          context.project_id,
                                                          res,
                                                          0, 0,
                                                          until_refresh or None,
-                                                         session=session,
-                                                         save=False)
+                                                         session=session)
 
                     # Update the usage
                     usages[res].in_use = in_use
@@ -2717,7 +2744,6 @@ def _quota_reservations(session, context, reservations):
     return model_query(context, models.Reservation,
                        read_deleted="no",
                        session=session).\
-                   options(joinedload('usage')).\
                    filter(models.Reservation.uuid.in_(reservations)).\
                    with_lockmode('update').\
                    all()
@@ -2727,25 +2753,35 @@ def _quota_reservations(session, context, reservations):
 def reservation_commit(context, reservations):
     session = get_session()
     with session.begin():
-        for reservation in _quota_reservations(session, context, reservations):
-            if reservation.delta >= 0:
-                reservation.usage.reserved -= reservation.delta
-            reservation.usage.in_use += reservation.delta
+        usages = _get_quota_usages(context, session)
 
-            reservation.usage.save(session=session)
+        for reservation in _quota_reservations(session, context, reservations):
+            usage = usages[reservation.resource]
+            if reservation.delta >= 0:
+                usage.reserved -= reservation.delta
+            usage.in_use += reservation.delta
+
             reservation.delete(session=session)
+
+        for usage in usages.values():
+            usage.save(session=session)
 
 
 @require_context
 def reservation_rollback(context, reservations):
     session = get_session()
     with session.begin():
+        usages = _get_quota_usages(context, session)
+
         for reservation in _quota_reservations(session, context, reservations):
+            usage = usages[reservation.resource]
             if reservation.delta >= 0:
-                reservation.usage.reserved -= reservation.delta
-                reservation.usage.save(session=session)
+                usage.reserved -= reservation.delta
 
             reservation.delete(session=session)
+
+        for usage in usages.values():
+            usage.save(session=session)
 
 
 @require_admin_context
@@ -3641,7 +3677,8 @@ def migration_get_by_instance_and_status(context, instance_uuid, status):
 
 
 @require_admin_context
-def migration_get_all_unconfirmed(context, confirm_window, session=None):
+def migration_get_unconfirmed_by_dest_compute(context, confirm_window,
+        dest_compute, session=None):
     confirm_window = (timeutils.utcnow() -
                       datetime.timedelta(seconds=confirm_window))
 
@@ -3649,6 +3686,7 @@ def migration_get_all_unconfirmed(context, confirm_window, session=None):
                        read_deleted="yes").\
             filter(models.Migration.updated_at <= confirm_window).\
             filter_by(status="finished").\
+            filter_by(dest_compute=dest_compute).\
             all()
 
 
@@ -4662,7 +4700,6 @@ def aggregate_create(context, values, metadata=None):
                                      values['name'],
                                      session=session,
                                      read_deleted='yes').first()
-    values.setdefault('operational_state', aggregate_states.CREATED)
     if not aggregate:
         aggregate = models.Aggregate()
         aggregate.update(values)
@@ -4738,7 +4775,6 @@ def aggregate_delete(context, aggregate_id):
     if query.first():
         query.update({'deleted': True,
                       'deleted_at': timeutils.utcnow(),
-                      'operational_state': aggregate_states.DISMISSED,
                       'updated_at': literal_column('updated_at')})
     else:
         raise exception.AggregateNotFound(aggregate_id=aggregate_id)
@@ -4864,13 +4900,10 @@ def aggregate_host_add(context, aggregate_id, host):
                                     read_deleted='yes').\
                                     filter_by(host=host).first()
     if not host_ref:
-        try:
-            host_ref = models.AggregateHost()
-            values = {"host": host, "aggregate_id": aggregate_id, }
-            host_ref.update(values)
-            host_ref.save(session=session)
-        except exception.DBError:
-            raise exception.AggregateHostConflict(host=host)
+        host_ref = models.AggregateHost()
+        values = {"host": host, "aggregate_id": aggregate_id, }
+        host_ref.update(values)
+        host_ref.save(session=session)
     elif host_ref.deleted:
         host_ref.update({'deleted': False, 'deleted_at': None})
         host_ref.save(session=session)

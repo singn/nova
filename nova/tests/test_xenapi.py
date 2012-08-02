@@ -23,15 +23,15 @@ import functools
 import os
 import re
 
-from nova.compute import aggregate_states
+from nova.compute import api as compute_api
 from nova.compute import instance_types
 from nova.compute import power_state
 from nova import context
 from nova import db
 from nova import exception
 from nova import flags
-from nova.image import glance
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova import test
@@ -43,6 +43,7 @@ from nova.tests.xenapi import stubs
 from nova.virt.xenapi import agent
 from nova.virt.xenapi import driver as xenapi_conn
 from nova.virt.xenapi import fake as xenapi_fake
+from nova.virt.xenapi import pool_states
 from nova.virt.xenapi import vm_utils
 from nova.virt.xenapi import vmops
 from nova.virt.xenapi import volume_utils
@@ -95,7 +96,7 @@ IMAGE_FIXTURES = {
 
 def set_image_fixtures():
     image_service = fake_image.FakeImageService()
-    image_service.delete_all()
+    image_service.images.clear()
     for image_id, image_meta in IMAGE_FIXTURES.items():
         image_meta = image_meta['image_meta']
         image_meta['id'] = image_id
@@ -282,6 +283,20 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         stubs.stubout_image_service_download(self.stubs)
         stubs.stubout_stream_disk(self.stubs)
 
+        def fake_inject_instance_metadata(self, instance, vm):
+            pass
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
+                       fake_inject_instance_metadata)
+
+        def fake_safe_copy_vdi(session, sr_ref, instance, vdi_to_copy_ref):
+            name_label = "fakenamelabel"
+            disk_type = "fakedisktype"
+            virtual_size = 777
+            return vm_utils.create_vdi(
+                    session, sr_ref, instance, name_label, disk_type,
+                    virtual_size)
+        self.stubs.Set(vm_utils, '_safe_copy_vdi', fake_safe_copy_vdi)
+
     def tearDown(self):
         super(XenAPIVMTestCase, self).tearDown()
         fake_image.FakeImageService_reset()
@@ -435,7 +450,7 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             tcpip_data = ast.literal_eval(xenstore_value)
             self.assertEquals(tcpip_data,
                               {'broadcast': '192.168.1.255',
-                               'dns': ['192.168.1.3', '192.168.1.4'],
+                               'dns': ['192.168.1.4', '192.168.1.3'],
                                'gateway': '192.168.1.1',
                                'gateway_v6': 'fe80::def',
                                'ip6s': [{'enabled': '1',
@@ -509,6 +524,12 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
                     hostname="test", architecture="x86-64", instance_id=1,
                     check_injection=False,
                     create_record=True, empty_dns=False):
+        # Fake out inject_instance_metadata
+        def fake_inject_instance_metadata(self, instance, vm):
+            pass
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
+                       fake_inject_instance_metadata)
+
         if create_record:
             instance_values = {'id': instance_id,
                       'project_id': self.project_id,
@@ -729,7 +750,7 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
 
         self.network.allocate_for_instance(ctxt,
                           instance_id=2,
-                          instance_uuid="00000000-0000-0000-0000-000000000000",
+                          instance_uuid='00000000-0000-0000-0000-000000000002',
                           host=FLAGS.host,
                           vpn=None,
                           rxtx_factor=3,
@@ -839,6 +860,7 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
         """Creates and spawns a test instance."""
         instance_values = {
             'id': instance_id,
+            'uuid': '00000000-0000-0000-0000-00000000000%d' % instance_id,
             'project_id': self.project_id,
             'user_id': self.user_id,
             'image_ref': 1,
@@ -847,6 +869,7 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
             'root_gb': 20,
             'instance_type_id': '3',  # m1.large
             'os_type': 'linux',
+            'vm_mode': 'hvm',
             'architecture': 'x86-64'}
         instance = db.instance_create(self.context, instance_values)
         network_info = fake_network.fake_get_instance_nw_info(self.stubs,
@@ -940,6 +963,11 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         stubs.stub_out_migration_methods(self.stubs)
         stubs.stubout_get_this_vm_uuid(self.stubs)
 
+        def fake_inject_instance_metadata(self, instance, vm):
+            pass
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
+                       fake_inject_instance_metadata)
+
     def test_resize_xenserver_6(self):
         instance = db.instance_create(self.context, self.instance_values)
         called = {'resize': False}
@@ -950,7 +978,27 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         self.stubs.Set(stubs.FakeSessionForVMTests,
                        "VDI_resize", fake_vdi_resize)
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
-                              product_version=(6, 0, 0))
+                              product_version=(6, 0, 0),
+                              product_brand='XenServer')
+        conn = xenapi_conn.XenAPIDriver(False)
+        vdi_ref = xenapi_fake.create_vdi('hurr', 'fake')
+        vdi_uuid = xenapi_fake.get_record('VDI', vdi_ref)['uuid']
+        conn._vmops._resize_instance(instance,
+                                     {'uuid': vdi_uuid, 'ref': vdi_ref})
+        self.assertEqual(called['resize'], True)
+
+        def test_resize_xcp(self):
+            instance = db.instance_create(self.context, self.instance_values)
+            called = {'resize': False}
+
+            def fake_vdi_resize(*args, **kwargs):
+                called['resize'] = True
+
+                self.stubs.Set(stubs.FakeSessionForVMTests,
+                               "VDI_resize", fake_vdi_resize)
+                stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+                                      product_version=(1, 4, 99),
+                                      product_brand='XCP')
         conn = xenapi_conn.XenAPIDriver(False)
         vdi_ref = xenapi_fake.create_vdi('hurr', 'fake')
         vdi_uuid = xenapi_fake.get_record('VDI', vdi_ref)['uuid']
@@ -1009,6 +1057,9 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
         self.stubs.Set(vmops.VMOps, 'finish_revert_migration',
                        fake_finish_revert_migration)
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+                              product_version=(4, 0, 0),
+                              product_brand='XenServer')
 
         conn = xenapi_conn.XenAPIDriver(False)
         network_info = fake_network.fake_get_instance_nw_info(self.stubs,
@@ -1041,6 +1092,9 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
         self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
         self.stubs.Set(stubs.FakeSessionForVMTests,
                        "VDI_resize_online", fake_vdi_resize)
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+                              product_version=(4, 0, 0),
+                              product_brand='XenServer')
 
         conn = xenapi_conn.XenAPIDriver(False)
         network_info = fake_network.fake_get_instance_nw_info(self.stubs,
@@ -1254,7 +1308,8 @@ class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
         vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
         vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
 
-        self.conn._vmops._attach_disks(instance, disk_image_type, vm_ref, vdis)
+        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
+                                       disk_image_type, vdis)
 
         self.assertEqual(marker["partition_called"], called)
 
@@ -1339,7 +1394,8 @@ class XenAPIGenerateLocal(stubs.XenAPITestBase):
         vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
 
         self.called = False
-        self.conn._vmops._attach_disks(instance, disk_image_type, vm_ref, vdis)
+        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
+                                       disk_image_type, vdis)
         self.assertTrue(self.called)
 
     def test_generate_swap(self):
@@ -1750,6 +1806,20 @@ class XenAPISRSelectionTestCase(stubs.XenAPITestBase):
                          expected)
 
 
+def _create_service_entries(context, values={'avail_zone1': ['fake_host1',
+                                                         'fake_host2'],
+                                         'avail_zone2': ['fake_host3'], }):
+    for avail_zone, hosts in values.iteritems():
+        for host in hosts:
+            db.service_create(context,
+                              {'host': host,
+                               'binary': 'nova-compute',
+                               'topic': 'compute',
+                               'report_count': 0,
+                               'availability_zone': avail_zone})
+    return values
+
+
 class XenAPIAggregateTestCase(stubs.XenAPITestBase):
     """Unit tests for aggregate operations."""
     def setUp(self):
@@ -1760,12 +1830,22 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                    instance_name_template='%d',
                    firewall_driver='nova.virt.xenapi.firewall.'
                                    'Dom0IptablesFirewallDriver',
-                   host='host')
+                   host='host',
+                   connection_type='xenapi',
+                   compute_driver='nova.virt.xenapi.driver.XenAPIDriver')
         host_ref = xenapi_fake.get_all('host')[0]
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         self.context = context.get_admin_context()
         self.conn = xenapi_conn.XenAPIDriver(False)
-        self.fake_metadata = {'master_compute': 'host',
+        self.compute = importutils.import_object(FLAGS.compute_manager)
+        self.api = compute_api.AggregateAPI()
+        values = {'name': 'test_aggr',
+                  'availability_zone': 'test_zone',
+                  'metadata': {pool_states.POOL_FLAG: 'XenAPI'}}
+        self.aggr = db.aggregate_create(self.context, values)
+        self.fake_metadata = {pool_states.POOL_FLAG: 'XenAPI',
+                              'master_compute': 'host',
+                              pool_states.KEY: pool_states.ACTIVE,
                               'host': xenapi_fake.get_record('host',
                                                              host_ref)['uuid']}
 
@@ -1789,7 +1869,6 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         result = db.aggregate_get(self.context, aggregate.id)
         self.assertTrue(fake_init_pool.called)
         self.assertDictMatch(self.fake_metadata, result.metadetails)
-        self.assertEqual(aggregate_states.ACTIVE, result.operational_state)
 
     def test_join_slave(self):
         """Ensure join_slave gets called when the request gets to master."""
@@ -1817,10 +1896,14 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         values = {"name": 'fake_aggregate',
                   "availability_zone": 'fake_zone'}
         result = db.aggregate_create(self.context, values)
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+                    pool_states.KEY: pool_states.CREATED}
+        db.aggregate_metadata_add(self.context, result.id, metadata)
+
         db.aggregate_host_add(self.context, result.id, "host")
         aggregate = db.aggregate_get(self.context, result.id)
         self.assertEqual(["host"], aggregate.hosts)
-        self.assertEqual({}, aggregate.metadetails)
+        self.assertEqual(metadata, aggregate.metadetails)
 
         self.conn._pool.add_to_aggregate(self.context, aggregate, "host")
         self.assertTrue(fake_pool_set_name_label.called)
@@ -1836,12 +1919,10 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         self.assertTrue(fake_remove_from_aggregate.called)
 
     def test_remove_from_empty_aggregate(self):
-        values = {"name": 'fake_aggregate',
-                  "availability_zone": 'fake_zone'}
-        result = db.aggregate_create(self.context, values)
-        self.assertRaises(exception.AggregateError,
+        result = self._aggregate_setup()
+        self.assertRaises(exception.InvalidAggregateAction,
                           self.conn._pool.remove_from_aggregate,
-                          None, result, "test_host")
+                          self.context, result, "test_host")
 
     def test_remove_slave(self):
         """Ensure eject slave gets called."""
@@ -1851,7 +1932,7 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
 
         self.fake_metadata['host2'] = 'fake_host2_uuid'
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
-                                          metadata=self.fake_metadata)
+                metadata=self.fake_metadata, aggr_state=pool_states.ACTIVE)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host2")
         self.assertTrue(fake_eject_slave.called)
 
@@ -1861,36 +1942,119 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
             fake_clear_pool.called = True
         self.stubs.Set(self.conn._pool, "_clear_pool", fake_clear_pool)
 
-        aggregate = self._aggregate_setup(aggr_state=aggregate_states.ACTIVE,
-                                          metadata=self.fake_metadata)
+        aggregate = self._aggregate_setup(metadata=self.fake_metadata)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host")
         result = db.aggregate_get(self.context, aggregate.id)
         self.assertTrue(fake_clear_pool.called)
-        self.assertDictMatch({}, result.metadetails)
-        self.assertEqual(aggregate_states.ACTIVE, result.operational_state)
+        self.assertDictMatch({pool_states.POOL_FLAG: 'XenAPI',
+                pool_states.KEY: pool_states.ACTIVE}, result.metadetails)
 
     def test_remote_master_non_empty_pool(self):
         """Ensure AggregateError is raised if removing the master."""
-        aggregate = self._aggregate_setup(aggr_state=aggregate_states.ACTIVE,
-                                          hosts=['host', 'host2'],
+        aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                                           metadata=self.fake_metadata)
+
         self.assertRaises(exception.InvalidAggregateAction,
                           self.conn._pool.remove_from_aggregate,
                           self.context, aggregate, "host")
 
     def _aggregate_setup(self, aggr_name='fake_aggregate',
                          aggr_zone='fake_zone',
-                         aggr_state=aggregate_states.CREATED,
+                         aggr_state=pool_states.CREATED,
                          hosts=['host'], metadata=None):
         values = {"name": aggr_name,
-                  "availability_zone": aggr_zone,
-                  "operational_state": aggr_state, }
+                  "availability_zone": aggr_zone}
         result = db.aggregate_create(self.context, values)
+        pool_flag = {pool_states.POOL_FLAG: "XenAPI",
+                    pool_states.KEY: aggr_state}
+        db.aggregate_metadata_add(self.context, result.id, pool_flag)
+
         for host in hosts:
             db.aggregate_host_add(self.context, result.id, host)
         if metadata:
             db.aggregate_metadata_add(self.context, result.id, metadata)
         return db.aggregate_get(self.context, result.id)
+
+    def test_add_host_to_aggregate_invalid_changing_status(self):
+        """Ensure InvalidAggregateAction is raised when adding host while
+        aggregate is not ready."""
+        aggregate = self._aggregate_setup(aggr_state=pool_states.CHANGING)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.conn.add_to_aggregate, self.context,
+                          aggregate, 'host')
+
+    def test_add_host_to_aggregate_invalid_dismissed_status(self):
+        """Ensure InvalidAggregateAction is raised when aggregate is
+        deleted."""
+        aggregate = self._aggregate_setup(aggr_state=pool_states.DISMISSED)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.conn.add_to_aggregate, self.context,
+                          aggregate, 'fake_host')
+
+    def test_add_host_to_aggregate_invalid_error_status(self):
+        """Ensure InvalidAggregateAction is raised when aggregate is
+        in error."""
+        aggregate = self._aggregate_setup(aggr_state=pool_states.ERROR)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.conn.add_to_aggregate, self.context,
+                          aggregate, 'fake_host')
+
+    def test_remove_host_from_aggregate_error(self):
+        """Ensure we can remove a host from an aggregate even if in error."""
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        aggr = self.api.create_aggregate(self.context,
+                                         'fake_aggregate', fake_zone)
+        # let's mock the fact that the aggregate is ready!
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+                    pool_states.KEY: pool_states.ACTIVE}
+        db.aggregate_metadata_add(self.context, aggr['id'], metadata)
+        for host in values[fake_zone]:
+            aggr = self.api.add_host_to_aggregate(self.context,
+                                                  aggr['id'], host)
+        # let's mock the fact that the aggregate is in error!
+        status = {'operational_state': pool_states.ERROR}
+        expected = self.api.remove_host_from_aggregate(self.context,
+                                                       aggr['id'],
+                                                       values[fake_zone][0])
+        self.assertEqual(len(aggr['hosts']) - 1, len(expected['hosts']))
+        self.assertEqual(expected['metadata'][pool_states.KEY],
+                         pool_states.ACTIVE)
+
+    def test_remove_host_from_aggregate_invalid_dismissed_status(self):
+        """Ensure InvalidAggregateAction is raised when aggregate is
+        deleted."""
+        aggregate = self._aggregate_setup(aggr_state=pool_states.DISMISSED)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.conn.remove_from_aggregate, self.context,
+                          aggregate, 'fake_host')
+
+    def test_remove_host_from_aggregate_invalid_changing_status(self):
+        """Ensure InvalidAggregateAction is raised when aggregate is
+        changing."""
+        aggregate = self._aggregate_setup(aggr_state=pool_states.CHANGING)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.conn.remove_from_aggregate, self.context,
+                          aggregate, 'fake_host')
+
+    def test_add_aggregate_host_raise_err(self):
+        """Ensure the undo operation works correctly on add."""
+        def fake_driver_add_to_aggregate(context, aggregate, host):
+            raise exception.AggregateError
+        self.stubs.Set(self.compute.driver, "add_to_aggregate",
+                       fake_driver_add_to_aggregate)
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+                    pool_states.KEY: pool_states.ACTIVE}
+        db.aggregate_metadata_add(self.context, self.aggr.id, metadata)
+        db.aggregate_host_add(self.context, self.aggr.id, 'fake_host')
+
+        self.assertRaises(exception.AggregateError,
+                          self.compute.add_aggregate_host,
+                          self.context, self.aggr.id, "fake_host")
+        excepted = db.aggregate_get(self.context, self.aggr.id)
+        self.assertEqual(excepted.metadetails[pool_states.KEY],
+                pool_states.ERROR)
+        self.assertEqual(excepted.hosts, [])
 
 
 class VmUtilsTestCase(test.TestCase):
@@ -1899,8 +2063,6 @@ class VmUtilsTestCase(test.TestCase):
     def test_upload_image(self):
         """Ensure image properties include instance system metadata
            as well as few local settings."""
-        def fake_pick_glance_api_server():
-            return ("host", 80)
 
         def fake_instance_system_metadata_get(context, uuid):
             return dict(image_a=1, image_b=2, image_c='c', d='d')
@@ -1908,11 +2070,13 @@ class VmUtilsTestCase(test.TestCase):
         def fake_get_sr_path(session):
             return "foo"
 
-        class FakeInstance(object):
-            auto_disk_config = "auto disk config"
-            os_type = "os type"
+        class FakeInstance(dict):
+            def __init__(self):
+                super(FakeInstance, self).__init__({
+                        'auto_disk_config': 'auto disk config',
+                        'os_type': 'os type'})
 
-            def __getitem__(instance_self, item):
+            def __missing__(self, item):
                 return "whatever"
 
         class FakeSession(object):
@@ -1922,8 +2086,6 @@ class VmUtilsTestCase(test.TestCase):
         def fake_dumps(thing):
             return thing
 
-        self.stubs.Set(glance, "pick_glance_api_server",
-                                                   fake_pick_glance_api_server)
         self.stubs.Set(db, "instance_system_metadata_get",
                                              fake_instance_system_metadata_get)
         self.stubs.Set(vm_utils, "get_sr_path", fake_get_sr_path)
@@ -1940,3 +2102,281 @@ class VmUtilsTestCase(test.TestCase):
                         auto_disk_config='auto disk config',
                         os_type='os type')
         self.assertEquals(expected, actual)
+
+
+class XenAPILiveMigrateTestCase(stubs.XenAPITestBase):
+    """Unit tests for live_migration."""
+    def setUp(self):
+        super(XenAPILiveMigrateTestCase, self).setUp()
+        self.flags(xenapi_connection_url='test_url',
+                   xenapi_connection_password='test_pass',
+                   firewall_driver='nova.virt.xenapi.firewall.'
+                                   'Dom0IptablesFirewallDriver',
+                   host='host')
+        db_fakes.stub_out_db_instance_api(self.stubs)
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        self.context = context.get_admin_context()
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+    def test_live_migration_calls_vmops(self):
+        def fake_live_migrate(context, instance_ref, dest, post_method,
+                              recover_method, block_migration):
+            fake_live_migrate.called = True
+        self.stubs.Set(self.conn._vmops, "live_migrate", fake_live_migrate)
+
+        self.conn.live_migration(None, None, None, None, None)
+        self.assertTrue(fake_live_migrate.called)
+
+    def test_pre_live_migration(self):
+        # ensure method is present
+        self.conn.pre_live_migration(None, None, None, None)
+
+    def test_post_live_migration_at_destination(self):
+        # ensure method is present
+        self.conn.post_live_migration_at_destination(None, None, None, None)
+
+    def test_check_can_live_migrate_raises_on_block_migrate(self):
+        self.assertRaises(NotImplementedError,
+                          self.conn.check_can_live_migrate_destination,
+                          None, None, True, None)
+
+    def test_check_can_live_migrate_works(self):
+        class fake_aggregate:
+            def __init__(self):
+                self.metadetails = {"host": "test_host_uuid"}
+
+        def fake_aggregate_get_by_host(context, host):
+            self.assertEqual(FLAGS.host, host)
+            return fake_aggregate()
+
+        self.stubs.Set(db, "aggregate_get_by_host",
+                fake_aggregate_get_by_host)
+        self.conn.check_can_live_migrate_destination(self.context,
+                {'host': 'host'}, False, False)
+
+    def test_check_can_live_migrate_fails(self):
+        class fake_aggregate:
+            def __init__(self):
+                self.metadetails = {"dest_other": "test_host_uuid"}
+
+        def fake_aggregate_get_by_host(context, host):
+            self.assertEqual(FLAGS.host, host)
+            return fake_aggregate()
+
+        self.stubs.Set(db, "aggregate_get_by_host",
+                      fake_aggregate_get_by_host)
+        self.assertRaises(exception.MigrationError,
+                          self.conn.check_can_live_migrate_destination,
+                          self.context, {'host': 'host'}, None, None)
+
+    def test_live_migration(self):
+        def fake_get_vm_opaque_ref(instance):
+            return "fake_vm"
+        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
+                       fake_get_vm_opaque_ref)
+
+        def fake_get_host_opaque_ref(context, destination_hostname):
+            return "fake_host"
+        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
+                       fake_get_host_opaque_ref)
+
+        def post_method(context, instance, destination_hostname,
+                        block_migration):
+            post_method.called = True
+
+        self.conn.live_migration(self.conn, None, None, post_method, None)
+
+        self.assertTrue(post_method.called, "post_method.called")
+
+    def test_live_migration_on_failure(self):
+        def fake_get_vm_opaque_ref(instance):
+            return "fake_vm"
+        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
+                       fake_get_vm_opaque_ref)
+
+        def fake_get_host_opaque_ref(context, destination_hostname):
+            return "fake_host"
+        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
+                       fake_get_host_opaque_ref)
+
+        def fake_call_xenapi(*args):
+            raise NotImplementedError()
+        self.stubs.Set(self.conn._vmops._session, "call_xenapi",
+                       fake_call_xenapi)
+
+        def recover_method(context, instance, destination_hostname,
+                        block_migration):
+            recover_method.called = True
+
+        self.assertRaises(NotImplementedError, self.conn.live_migration,
+                          self.conn, None, None, None, recover_method)
+        self.assertTrue(recover_method.called, "recover_method.called")
+
+
+class XenAPIInjectMetadataTestCase(stubs.XenAPITestBase):
+    def setUp(self):
+        super(XenAPIInjectMetadataTestCase, self).setUp()
+        self.flags(xenapi_connection_url='test_url',
+                   xenapi_connection_password='test_pass',
+                   firewall_driver='nova.virt.xenapi.firewall.'
+                                   'Dom0IptablesFirewallDriver')
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+        self.xenstore = dict(persist={}, ephem={})
+
+        def fake_get_vm_opaque_ref(inst, instance):
+            self.assertEqual(instance, 'instance')
+            return 'vm_ref'
+
+        def fake_add_to_param_xenstore(inst, vm_ref, key, val):
+            self.assertEqual(vm_ref, 'vm_ref')
+            self.xenstore['persist'][key] = val
+
+        def fake_remove_from_param_xenstore(inst, vm_ref, key):
+            self.assertEqual(vm_ref, 'vm_ref')
+            if key in self.xenstore['persist']:
+                del self.xenstore['persist'][key]
+
+        def fake_write_to_xenstore(inst, instance, path, value, vm_ref=None):
+            self.assertEqual(instance, 'instance')
+            self.assertEqual(vm_ref, 'vm_ref')
+            self.xenstore['ephem'][path] = jsonutils.dumps(value)
+
+        def fake_delete_from_xenstore(inst, instance, path, vm_ref=None):
+            self.assertEqual(instance, 'instance')
+            self.assertEqual(vm_ref, 'vm_ref')
+            if path in self.xenstore['ephem']:
+                del self.xenstore['ephem'][path]
+
+        self.stubs.Set(vmops.VMOps, '_get_vm_opaque_ref',
+                       fake_get_vm_opaque_ref)
+        self.stubs.Set(vmops.VMOps, '_add_to_param_xenstore',
+                       fake_add_to_param_xenstore)
+        self.stubs.Set(vmops.VMOps, '_remove_from_param_xenstore',
+                       fake_remove_from_param_xenstore)
+        self.stubs.Set(vmops.VMOps, '_write_to_xenstore',
+                       fake_write_to_xenstore)
+        self.stubs.Set(vmops.VMOps, '_delete_from_xenstore',
+                       fake_delete_from_xenstore)
+
+    def test_inject_instance_metadata(self):
+        class FakeMetaItem(object):
+            def __init__(self, key, value):
+                self.key = key
+                self.value = value
+
+        # Add some system_metadata to ensure it doesn't get added
+        # to xenstore
+        instance = dict(metadata=[FakeMetaItem("a", 1),
+                                  FakeMetaItem("b", 2),
+                                  FakeMetaItem("c", 3),
+                                  # Check xenstore key sanitizing
+                                  FakeMetaItem("hi.there", 4),
+                                  FakeMetaItem("hi!t.e/e", 5)],
+                        system_metadata=[FakeMetaItem("sys_a", 1),
+                                         FakeMetaItem("sys_b", 2),
+                                         FakeMetaItem("sys_c", 3)])
+        self.conn._vmops.inject_instance_metadata(instance, 'vm_ref')
+
+        self.assertEqual(self.xenstore, {
+                'persist': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/b': '2',
+                    'vm-data/user-metadata/c': '3',
+                    'vm-data/user-metadata/hi_there': '4',
+                    'vm-data/user-metadata/hi_t_e_e': '5',
+                    },
+                'ephem': {},
+                })
+
+    def test_change_instance_metadata_add(self):
+        # Test XenStore key sanitizing here, too.
+        diff = {'test.key': ['+', 4]}
+        self.xenstore = {
+            'persist': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            'ephem': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            }
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+        self.assertEqual(self.xenstore, {
+                'persist': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/b': '2',
+                    'vm-data/user-metadata/c': '3',
+                    'vm-data/user-metadata/test_key': '4',
+                    },
+                'ephem': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/b': '2',
+                    'vm-data/user-metadata/c': '3',
+                    'vm-data/user-metadata/test_key': '4',
+                    },
+                })
+
+    def test_change_instance_metadata_update(self):
+        diff = dict(b=['+', 4])
+        self.xenstore = {
+            'persist': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            'ephem': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            }
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+        self.assertEqual(self.xenstore, {
+                'persist': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/b': '4',
+                    'vm-data/user-metadata/c': '3',
+                    },
+                'ephem': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/b': '4',
+                    'vm-data/user-metadata/c': '3',
+                    },
+                })
+
+    def test_change_instance_metadata_delete(self):
+        diff = dict(b=['-'])
+        self.xenstore = {
+            'persist': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            'ephem': {
+                'vm-data/user-metadata/a': '1',
+                'vm-data/user-metadata/b': '2',
+                'vm-data/user-metadata/c': '3',
+                },
+            }
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+        self.assertEqual(self.xenstore, {
+                'persist': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/c': '3',
+                    },
+                'ephem': {
+                    'vm-data/user-metadata/a': '1',
+                    'vm-data/user-metadata/c': '3',
+                    },
+                })

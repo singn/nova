@@ -36,7 +36,7 @@ FAKE_UUID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 def network_api_get_fixed_ip(self, context, id):
     if id is None:
         return None
-    return {'address': '10.0.0.1', 'id': id, 'instance_id': 1}
+    return {'address': '10.0.0.1', 'id': id, 'instance_uuid': 1}
 
 
 def network_api_get_floating_ip(self, context, id):
@@ -99,6 +99,10 @@ def stub_nw_info(stubs):
     return get_nw_info_for_instance
 
 
+def get_instance_by_floating_ip_addr(self, context, address):
+    return None
+
+
 class FloatingIpTest(test.TestCase):
     floating_ip = "10.10.10.10"
 
@@ -129,6 +133,8 @@ class FloatingIpTest(test.TestCase):
                        network_api_release)
         self.stubs.Set(network.api.API, "disassociate_floating_ip",
                        network_api_disassociate)
+        self.stubs.Set(network.api.API, "get_instance_id_by_floating_address",
+                       get_instance_by_floating_ip_addr)
         self.stubs.Set(compute_utils, "get_nw_info_for_instance",
                        stub_nw_info(self.stubs))
 
@@ -208,7 +214,7 @@ class FloatingIpTest(test.TestCase):
                     'fixed_ip_id': 11}
 
         def get_fixed_ip(self, context, id):
-            return {'address': '10.0.0.1', 'instance_id': 1}
+            return {'address': '10.0.0.1', 'instance_uuid': 1}
 
         self.stubs.Set(network.api.API, "get_floating_ip", get_floating_ip)
         self.stubs.Set(network.api.API, "get_fixed_ip", get_fixed_ip)
@@ -228,7 +234,7 @@ class FloatingIpTest(test.TestCase):
         self.stubs.Set(rpc, "call", fake_call)
 
         req = fakes.HTTPRequest.blank('/v2/fake/os-floating-ips')
-        self.assertRaises(webob.exc.HTTPRequestEntityTooLarge,
+        self.assertRaises(exception.NoMoreFloatingIps,
                           self.controller.create,
                           req)
 
@@ -274,6 +280,13 @@ class FloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
         self.manager._remove_floating_ip(req, 'test_inst', body)
+
+    def test_floating_ip_disassociate_missing(self):
+        body = dict(removeFloatingIp=dict(address='10.10.10.10'))
+
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
+        rsp = self.manager._remove_floating_ip(req, 'test_inst', body)
+        self.assertTrue(rsp.status_int == 404)
 
 # these are a few bad param tests
 

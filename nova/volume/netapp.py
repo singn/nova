@@ -117,7 +117,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         a few seconds to parse.
         """
         wsdl_url = kwargs['wsdl_url']
-        LOG.debug('Using WSDL: %s' % wsdl_url)
+        LOG.debug(_('Using WSDL: %s') % wsdl_url)
         if kwargs['cache']:
             self.client = client.Client(wsdl_url, username=kwargs['login'],
                                         password=kwargs['password'])
@@ -127,22 +127,23 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
                                         cache=None)
         soap_url = 'http://%s:%s/apis/soap/v1' % (kwargs['hostname'],
                                                   kwargs['port'])
-        LOG.debug('Using DFM server: %s' % soap_url)
+        LOG.debug(_('Using DFM server: %s') % soap_url)
         self.client.set_options(location=soap_url)
 
     def _set_storage_service(self, storage_service):
         """Set the storage service to use for provisioning."""
-        LOG.debug('Using storage service: %s' % storage_service)
+        LOG.debug(_('Using storage service: %s') % storage_service)
         self.storage_service = storage_service
 
     def _set_storage_service_prefix(self, storage_service_prefix):
         """Set the storage service prefix to use for provisioning."""
-        LOG.debug('Using storage service prefix: %s' % storage_service_prefix)
+        LOG.debug(_('Using storage service prefix: %s') %
+                  storage_service_prefix)
         self.storage_service_prefix = storage_service_prefix
 
     def _set_vfiler(self, vfiler):
         """Set the vfiler to use for provisioning."""
-        LOG.debug('Using vfiler: %s' % vfiler)
+        LOG.debug(_('Using vfiler: %s') % vfiler)
         self.vfiler = vfiler
 
     def _check_flags(self):

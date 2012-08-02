@@ -39,7 +39,7 @@ def stubout_firewall_driver(stubs, conn):
 
 
 def stubout_instance_snapshot(stubs):
-    def fake_fetch_image(context, session, instance, image, type):
+    def fake_fetch_image(context, session, instance, name_label, image, type):
         return {'root': dict(uuid=_make_fake_vdi(), file=None),
                 'kernel': dict(uuid=_make_fake_vdi(), file=None),
                 'ramdisk': dict(uuid=_make_fake_vdi(), file=None)}
@@ -53,12 +53,13 @@ def stubout_instance_snapshot(stubs):
     stubs.Set(vm_utils, '_wait_for_vhd_coalesce', fake_wait_for_vhd_coalesce)
 
 
-def stubout_session(stubs, cls, product_version=(5, 6, 2), **opt_args):
+def stubout_session(stubs, cls, product_version=(5, 6, 2),
+                    product_brand='XenServer', **opt_args):
     """Stubs out methods from XenAPISession"""
     stubs.Set(xenapi_conn.XenAPISession, '_create_session',
               lambda s, url: cls(url, **opt_args))
-    stubs.Set(xenapi_conn.XenAPISession, '_get_product_version',
-              lambda s: product_version)
+    stubs.Set(xenapi_conn.XenAPISession, '_get_product_version_and_brand',
+              lambda s: (product_version, product_brand))
 
 
 def stubout_get_this_vm_uuid(stubs):
@@ -116,8 +117,8 @@ def stubout_lookup_image(stubs):
 def stubout_fetch_disk_image(stubs, raise_failure=False):
     """Simulates a failure in fetch image_glance_disk."""
 
-    def _fake_fetch_disk_image(context, session, instance, image,
-                                      image_type):
+    def _fake_fetch_disk_image(context, session, instance, name_label, image,
+                               image_type):
         if raise_failure:
             raise fake.Failure("Test Exception raised by "
                                "fake fetch_image_glance_disk")
@@ -346,7 +347,7 @@ def stub_out_migration_methods(stubs):
         pass
 
     stubs.Set(vmops.VMOps, '_destroy', fake_destroy)
-    stubs.Set(vmops.VMOps, '_move_disks', fake_move_disks)
+    stubs.Set(vm_utils, 'move_disks', fake_move_disks)
     stubs.Set(vm_utils, 'scan_default_sr', fake_sr)
     stubs.Set(vm_utils, '_scan_sr', fake_sr)
     stubs.Set(vm_utils, 'snapshot_attached_here', fake_snapshot_attached_here)

@@ -262,7 +262,11 @@ def stub_out_glance_add_image(stubs, sent_to_glance):
 def stub_out_glance(stubs):
     def fake_get_remote_image_service():
         client = glance_stubs.StubGlanceClient(_make_image_fixtures())
-        return nova.image.glance.GlanceImageService(client)
+        client_wrapper = nova.image.glance.GlanceClientWrapper()
+        client_wrapper.host = 'fake_host'
+        client_wrapper.port = 9292
+        client_wrapper.client = client
+        return nova.image.glance.GlanceImageService(client=client_wrapper)
     stubs.Set(nova.image.glance,
               'get_default_image_service',
               fake_get_remote_image_service)
@@ -393,7 +397,7 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
                   flavor_id="1", name=None, key_name='',
                   access_ipv4=None, access_ipv6=None, progress=0,
                   auto_disk_config=False, display_name=None,
-                  include_fake_metadata=True,
+                  include_fake_metadata=True, config_drive=None,
                   power_state=None, nw_cache=None, metadata=None,
                   security_groups=None):
 
@@ -442,6 +446,7 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
         "launch_index": 0,
         "key_name": key_name,
         "key_data": key_data,
+        "config_drive": config_drive,
         "vm_state": vm_state or vm_states.BUILDING,
         "task_state": task_state,
         "power_state": power_state,
@@ -494,7 +499,7 @@ def stub_volume(id, **kwargs):
         'name': 'vol name',
         'display_name': 'displayname',
         'display_description': 'displaydesc',
-        'created_at': datetime.datetime(1, 1, 1, 1, 1, 1),
+        'created_at': datetime.datetime(1999, 1, 1, 1, 1, 1),
         'snapshot_id': None,
         'volume_type_id': 'fakevoltype',
         'volume_metadata': [],

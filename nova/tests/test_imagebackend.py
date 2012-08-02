@@ -1,4 +1,3 @@
-#!/usr/bin/python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2012 Grid Dynamics
@@ -38,12 +37,11 @@ class _ImageTestCase(test.TestCase):
         super(_ImageTestCase, self).setUp()
         self.flags(instances_path=self.INSTANCES_PATH)
         self.INSTANCE = 'instance'
-        self.NAME = 'fake'
-        self.SUFFIX = 'vm'
+        self.NAME = 'fake.vm'
         self.TEMPLATE = 'template'
 
         self.PATH = os.path.join(FLAGS.instances_path, self.INSTANCE,
-                                 self.NAME + self.SUFFIX)
+                                 self.NAME)
         self.TEMPLATE_DIR = os.path.join(FLAGS.instances_path,
                                          '_base')
         self.TEMPLATE_PATH = os.path.join(self.TEMPLATE_DIR, 'template')
@@ -61,7 +59,7 @@ class _ImageTestCase(test.TestCase):
         imagebackend.libvirt_utils.ensure_tree(self.TEMPLATE_DIR)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         self.mock_create_image(image)
         image.cache(fn, self.TEMPLATE)
 
@@ -72,7 +70,7 @@ class _ImageTestCase(test.TestCase):
         os.path.exists(self.PATH).AndReturn(True)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.cache(None, self.TEMPLATE)
 
         self.mox.VerifyAll()
@@ -87,7 +85,7 @@ class _ImageTestCase(test.TestCase):
         self.mox.StubOutWithMock(imagebackend.libvirt_utils, 'ensure_tree')
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         self.mock_create_image(image)
         image.cache(fn, self.TEMPLATE)
 
@@ -101,7 +99,7 @@ class _ImageTestCase(test.TestCase):
         fn = self.mox.CreateMockAnything()
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         self.mock_create_image(image)
         image.cache(fn, self.TEMPLATE)
 
@@ -129,7 +127,7 @@ class RawTestCase(_ImageTestCase):
         imagebackend.libvirt_utils.copy_image(self.TEMPLATE_PATH, self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, None, image_id=None)
 
         self.mox.VerifyAll()
@@ -139,7 +137,7 @@ class RawTestCase(_ImageTestCase):
         fn(target=self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, None)
 
         self.mox.VerifyAll()
@@ -151,7 +149,7 @@ class RawTestCase(_ImageTestCase):
         imagebackend.disk.extend(self.PATH, self.SIZE)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE, image_id=None)
 
         self.mox.VerifyAll()
@@ -182,7 +180,7 @@ class Qcow2TestCase(_ImageTestCase):
                                                     self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, None)
 
         self.mox.VerifyAll()
@@ -199,7 +197,7 @@ class Qcow2TestCase(_ImageTestCase):
                                                     self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
 
         self.mox.VerifyAll()
@@ -213,7 +211,7 @@ class Qcow2TestCase(_ImageTestCase):
                                                     self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
 
         self.mox.VerifyAll()
@@ -228,7 +226,7 @@ class LvmTestCase(_ImageTestCase):
         self.image_class = imagebackend.Lvm
         super(LvmTestCase, self).setUp()
         self.flags(libvirt_images_volume_group=self.VG)
-        self.LV = '%s_%s' % (self.INSTANCE, self.NAME + self.SUFFIX)
+        self.LV = '%s_%s' % (self.INSTANCE, self.NAME)
         self.PATH = os.path.join('/dev', self.VG, self.LV)
 
         self.disk = imagebackend.disk
@@ -237,27 +235,27 @@ class LvmTestCase(_ImageTestCase):
 
     def prepare_mocks(self):
         fn = self.mox.CreateMockAnything()
-        self.mox.StubOutWithMock(self.disk, 'get_image_virtual_size')
         self.mox.StubOutWithMock(self.disk, 'resize2fs')
         self.mox.StubOutWithMock(self.libvirt_utils, 'create_lvm_image')
+        self.mox.StubOutWithMock(self.disk, 'get_disk_size')
         self.mox.StubOutWithMock(self.utils, 'execute')
         return fn
 
     def _create_image(self, sparse):
         fn = self.prepare_mocks()
         fn(target=self.TEMPLATE_PATH)
-        self.disk.get_image_virtual_size(self.TEMPLATE_PATH
-                                         ).AndReturn(self.TEMPLATE_SIZE)
         self.libvirt_utils.create_lvm_image(self.VG,
                                             self.LV,
                                             self.TEMPLATE_SIZE,
                                             sparse=sparse)
+        self.disk.get_disk_size(self.TEMPLATE_PATH
+                                         ).AndReturn(self.TEMPLATE_SIZE)
         cmd = ('dd', 'if=%s' % self.TEMPLATE_PATH,
                'of=%s' % self.PATH, 'bs=4M')
         self.utils.execute(*cmd, run_as_root=True)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, None)
 
         self.mox.VerifyAll()
@@ -269,7 +267,7 @@ class LvmTestCase(_ImageTestCase):
         fn(target=self.PATH, ephemeral_size=None)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH,
                 self.SIZE, ephemeral_size=None)
 
@@ -278,17 +276,17 @@ class LvmTestCase(_ImageTestCase):
     def _create_image_resize(self, sparse):
         fn = self.prepare_mocks()
         fn(target=self.TEMPLATE_PATH)
-        self.disk.get_image_virtual_size(self.TEMPLATE_PATH
-                                         ).AndReturn(self.TEMPLATE_SIZE)
         self.libvirt_utils.create_lvm_image(self.VG, self.LV,
                                             self.SIZE, sparse=sparse)
+        self.disk.get_disk_size(self.TEMPLATE_PATH
+                                         ).AndReturn(self.TEMPLATE_SIZE)
         cmd = ('dd', 'if=%s' % self.TEMPLATE_PATH,
                'of=%s' % self.PATH, 'bs=4M')
         self.utils.execute(*cmd, run_as_root=True)
         self.disk.resize2fs(self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
 
         self.mox.VerifyAll()
@@ -317,18 +315,18 @@ class LvmTestCase(_ImageTestCase):
     def test_create_image_negative(self):
         fn = self.prepare_mocks()
         fn(target=self.TEMPLATE_PATH)
-        self.disk.get_image_virtual_size(self.TEMPLATE_PATH
-                                         ).AndReturn(self.TEMPLATE_SIZE)
         self.libvirt_utils.create_lvm_image(self.VG,
                                             self.LV,
                                             self.SIZE,
                                             sparse=False
                                             ).AndRaise(RuntimeError())
+        self.disk.get_disk_size(self.TEMPLATE_PATH
+                                         ).AndReturn(self.TEMPLATE_SIZE)
         self.mox.StubOutWithMock(self.libvirt_utils, 'remove_logical_volumes')
         self.libvirt_utils.remove_logical_volumes(self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
 
         self.assertRaises(RuntimeError, image.create_image, fn,
                           self.TEMPLATE_PATH, self.SIZE)
@@ -346,7 +344,7 @@ class LvmTestCase(_ImageTestCase):
         self.libvirt_utils.remove_logical_volumes(self.PATH)
         self.mox.ReplayAll()
 
-        image = self.image_class(self.INSTANCE, self.NAME, self.SUFFIX)
+        image = self.image_class(self.INSTANCE, self.NAME)
 
         self.assertRaises(RuntimeError, image.create_image, fn,
                           self.TEMPLATE_PATH, self.SIZE,
@@ -356,13 +354,11 @@ class LvmTestCase(_ImageTestCase):
 
 class BackendTestCase(test.TestCase):
     INSTANCE = 'fake-instance'
-    NAME = 'fake-name'
-    SUFFIX = 'suffix'
+    NAME = 'fake-name.suffix'
 
     def get_image(self, use_cow, image_type):
         return imagebackend.Backend(use_cow).image(self.INSTANCE,
                                                    self.NAME,
-                                                   self.SUFFIX,
                                                    image_type)
 
     def _test_image(self, image_type, image_not_cow, image_cow):

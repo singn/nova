@@ -232,6 +232,11 @@ def compute_node_utilization_set(context, host, free_ram_mb=None,
     return IMPL.compute_node_utilization_set(context, host, free_ram_mb,
                                              free_disk_gb, work, vms)
 
+
+def compute_node_statistics(context):
+    return IMPL.compute_node_statistics(context)
+
+
 ###################
 
 
@@ -405,33 +410,39 @@ def migration_get_by_instance_and_status(context, instance_uuid, status):
             status)
 
 
-def migration_get_all_unconfirmed(context, confirm_window):
-    """Finds all unconfirmed migrations within the confirmation window."""
-    return IMPL.migration_get_all_unconfirmed(context, confirm_window)
+def migration_get_unconfirmed_by_dest_compute(context, confirm_window,
+        dest_compute):
+    """
+    Finds all unconfirmed migrations within the confirmation window for
+    a specific destination compute host.
+    """
+    return IMPL.migration_get_unconfirmed_by_dest_compute(context,
+            confirm_window, dest_compute)
 
 
 ####################
 
 
-def fixed_ip_associate(context, address, instance_id, network_id=None,
+def fixed_ip_associate(context, address, instance_uuid, network_id=None,
                        reserved=False):
     """Associate fixed ip to instance.
 
     Raises if fixed ip is not available.
 
     """
-    return IMPL.fixed_ip_associate(context, address, instance_id, network_id,
+    return IMPL.fixed_ip_associate(context, address, instance_uuid, network_id,
                                    reserved)
 
 
-def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
+def fixed_ip_associate_pool(context, network_id, instance_uuid=None,
+                            host=None):
     """Find free ip in network and associate it to instance or host.
 
     Raises if one is not available.
 
     """
     return IMPL.fixed_ip_associate_pool(context, network_id,
-                                        instance_id, host)
+                                        instance_uuid, host)
 
 
 def fixed_ip_create(context, values):
@@ -469,14 +480,14 @@ def fixed_ip_get_by_address(context, address):
     return IMPL.fixed_ip_get_by_address(context, address)
 
 
-def fixed_ip_get_by_instance(context, instance_id):
+def fixed_ip_get_by_instance(context, instance_uuid):
     """Get fixed ips by instance or raise if none exist."""
-    return IMPL.fixed_ip_get_by_instance(context, instance_id)
+    return IMPL.fixed_ip_get_by_instance(context, instance_uuid)
 
 
-def fixed_ip_get_by_network_host(context, network_id, host):
+def fixed_ip_get_by_network_host(context, network_uuid, host):
     """Get fixed ip for a host in a network."""
-    return IMPL.fixed_ip_get_by_network_host(context, network_id, host)
+    return IMPL.fixed_ip_get_by_network_host(context, network_uuid, host)
 
 
 def fixed_ips_by_virtual_interface(context, vif_id):
@@ -1042,7 +1053,7 @@ def reservation_rollback(context, reservations):
 
 def quota_destroy_all_by_project(context, project_id):
     """Destroy all quotas associated with a given project."""
-    return IMPL.quota_get_all_by_project(context, project_id)
+    return IMPL.quota_destroy_all_by_project(context, project_id)
 
 
 def reservation_expire(context):

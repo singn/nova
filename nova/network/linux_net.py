@@ -628,19 +628,19 @@ def get_dhcp_opts(context, network_ref):
                                                host=host)
 
     if data:
-        #set of instance ids
-        instance_set = set([datum['instance_id'] for datum in data])
+        instance_set = set([datum['instance_uuid'] for datum in data])
         default_gw_vif = {}
-        for instance_id in instance_set:
-            vifs = db.virtual_interface_get_by_instance(context, instance_id)
+        for instance_uuid in instance_set:
+            vifs = db.virtual_interface_get_by_instance(context,
+                                                        instance_uuid)
             if vifs:
                 #offer a default gateway to the first virtual interface
-                default_gw_vif[instance_id] = vifs[0]['id']
+                default_gw_vif[instance_uuid] = vifs[0]['id']
 
         for datum in data:
-            if instance_id in default_gw_vif:
+            if instance_uuid in default_gw_vif:
                 # we don't want default gateway for this fixed ip
-                if default_gw_vif[instance_id] != datum['vif_id']:
+                if default_gw_vif[instance_uuid] != datum['vif_id']:
                     hosts.append(_host_dhcp_opts(datum))
     return '\n'.join(hosts)
 
@@ -724,8 +724,10 @@ def restart_dhcp(context, dev, network_ref):
            '--pid-file=%s' % _dhcp_file(dev, 'pid'),
            '--listen-address=%s' % network_ref['dhcp_server'],
            '--except-interface=lo',
-           '--dhcp-range=%s,static,%ss' % (network_ref['dhcp_start'],
-                                           FLAGS.dhcp_lease_time),
+           '--dhcp-range=set:\'%s\',%s,static,%ss' %
+                         (network_ref['label'],
+                          network_ref['dhcp_start'],
+                          FLAGS.dhcp_lease_time),
            '--dhcp-lease-max=%s' % len(netaddr.IPNetwork(network_ref['cidr'])),
            '--dhcp-hostsfile=%s' % _dhcp_file(dev, 'conf'),
            '--dhcp-script=%s' % FLAGS.dhcpbridge,
@@ -987,16 +989,20 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
             LOG.debug(_('Starting VLAN inteface %s'), interface)
             _execute('ip', 'link', 'add', 'link', bridge_interface,
                      'name', interface, 'type', 'vlan',
-                     'id', vlan_num, run_as_root=True)
+                     'id', vlan_num, run_as_root=True,
+                     check_exit_code=[0, 2, 254])
             # (danwent) the bridge will inherit this address, so we want to
             # make sure it is the value set from the NetworkManager
             if mac_address:
                 _execute('ip', 'link', 'set', interface, 'address',
-                         mac_address, run_as_root=True)
-            _execute('ip', 'link', 'set', interface, 'up', run_as_root=True)
+                         mac_address, run_as_root=True,
+                         check_exit_code=[0, 2, 254])
+            _execute('ip', 'link', 'set', interface, 'up', run_as_root=True,
+                     check_exit_code=[0, 2, 254])
             if FLAGS.network_device_mtu:
                 _execute('ip', 'link', 'set', interface, 'mtu',
-                         FLAGS.network_device_mtu, run_as_root=True)
+                         FLAGS.network_device_mtu, run_as_root=True,
+                         check_exit_code=[0, 2, 254])
         return interface
 
     @classmethod

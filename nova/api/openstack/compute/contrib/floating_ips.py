@@ -120,13 +120,13 @@ class FloatingIPController(object):
         fixed_ip_id = floating_ip['fixed_ip_id']
         floating_ip['fixed_ip'] = self._get_fixed_ip(context,
                                                      fixed_ip_id)
-        instance_id = None
+        instance_uuid = None
         if floating_ip['fixed_ip']:
-            instance_id = floating_ip['fixed_ip']['instance_id']
+            instance_uuid = floating_ip['fixed_ip']['instance_uuid']
 
-        if instance_id:
+        if instance_uuid:
             floating_ip['instance'] = self._get_instance(context,
-                                                         instance_id)
+                                                         instance_uuid)
         else:
             floating_ip['instance'] = None
 
@@ -169,12 +169,12 @@ class FloatingIPController(object):
         try:
             address = self.network_api.allocate_floating_ip(context, pool)
             ip = self.network_api.get_floating_ip_by_address(context, address)
-        except exception.NoMoreFloatingIps:
+        except exception.NoMoreFloatingIps, nmfi:
             if pool:
-                msg = _("No more floating ips in pool %s.") % pool
+                nmfi.message = _("No more floating ips in pool %s.") % pool
             else:
-                msg = _("No more floating ips available.")
-            raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
+                nmfi.message = _("No more floating ips available.")
+            raise nmfi
 
         return _translate_floating_ip_view(ip)
 
@@ -282,10 +282,11 @@ class FloatingIPActionController(wsgi.Controller):
         instance = get_instance_by_floating_ip_addr(self, context, address)
 
         # disassociate if associated
-        if floating_ip.get('fixed_ip_id'):
+        if instance and floating_ip.get('fixed_ip_id'):
             disassociate_floating_ip(self, context, instance, address)
-
-        return webob.Response(status_int=202)
+            return webob.Response(status_int=202)
+        else:
+            return webob.Response(status_int=404)
 
 
 class Floating_ips(extensions.ExtensionDescriptor):

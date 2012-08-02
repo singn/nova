@@ -43,6 +43,7 @@ from nova.openstack.common import rpc
 from nova import test
 from nova.tests.image import fake
 from nova import utils
+from nova.virt import fake as fake_virt
 
 
 LOG = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show(meh, context, id):
             return {'id': id,
+                    'name': 'fake_name',
                     'container_format': 'ami',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -237,7 +239,7 @@ class CloudTestCase(test.TestCase):
         project_id = self.context.project_id
         nw_info = self.network.allocate_for_instance(self.context,
                                                  instance_id=inst['id'],
-                                                 instance_uuid='',
+                                                 instance_uuid=inst['uuid'],
                                                  host=inst['host'],
                                                  vpn=None,
                                                  rxtx_factor=3,
@@ -1123,6 +1125,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_detail(meh, context, **kwargs):
             return [{'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                     'name': 'fake_name',
                      'container_format': 'ami',
                      'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -1190,6 +1193,7 @@ class CloudTestCase(test.TestCase):
             {'device_name': '/dev/sdc4', 'no_device': True}]
         image1 = {
             'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+            'name': 'fake_name',
             'properties': {
                 'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                 'type': 'machine',
@@ -1204,6 +1208,7 @@ class CloudTestCase(test.TestCase):
                                   'snapshot_id': 01234567}]
         image2 = {
             'id': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
+            'name': 'fake_name',
             'properties': {
                 'kernel_id': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
                 'type': 'machine',
@@ -1313,6 +1318,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show(meh, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -1330,6 +1336,12 @@ class CloudTestCase(test.TestCase):
         result = describe_image_attribute(self.context, 'ami-00000001',
                                           'launchPermission')
         self.assertEqual([{'group': 'all'}], result['launchPermission'])
+        result = describe_image_attribute(self.context, 'ami-00000001',
+                                          'kernel')
+        self.assertEqual('aki-00000001', result['kernel']['value'])
+        result = describe_image_attribute(self.context, 'ami-00000001',
+                                          'ramdisk')
+        self.assertEqual('ari-00000001', result['ramdisk']['value'])
 
     def test_describe_image_attribute_root_device_name(self):
         describe_image_attribute = self.cloud.describe_image_attribute
@@ -1362,6 +1374,7 @@ class CloudTestCase(test.TestCase):
 
         fake_metadata = {
             'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+            'name': 'fake_name',
             'container_format': 'ami',
             'properties': {
                 'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -1402,6 +1415,7 @@ class CloudTestCase(test.TestCase):
             # NOTE(vish): We are mocking s3 so make sure we have converted
             #             to ids instead of uuids.
             return {'id': 1,
+            'name': 'fake_name',
             'container_format': 'ami',
             'properties': {
                 'kernel_id': 1,
@@ -1634,6 +1648,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show(self, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'type': 'machine'},
@@ -1667,6 +1682,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show(self, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'type': 'machine'},
@@ -1700,6 +1716,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show_no_state(self, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -1718,6 +1735,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show_decrypt(self, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'container_format': 'ami',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -1737,6 +1755,7 @@ class CloudTestCase(test.TestCase):
 
         def fake_show_stat_active(self, context, id):
             return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
                     'container_format': 'ami',
                     'properties': {
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
@@ -2158,7 +2177,7 @@ class CloudTestCase(test.TestCase):
         for snapshot_id in (ec2_snapshot1_id, ec2_snapshot2_id):
             self.cloud.delete_snapshot(self.context, snapshot_id)
 
-    def test_create_image(self):
+    def _do_test_create_image(self, no_reboot):
         """Make sure that CreateImage works"""
         # enforce periodic tasks run in short time to avoid wait for 60s.
         self._restart_compute_service(periodic_interval=0.3)
@@ -2171,13 +2190,74 @@ class CloudTestCase(test.TestCase):
                   'max_count': 1}
         ec2_instance_id = self._run_instance(**kwargs)
 
-        # TODO(yamahata): s3._s3_create() can't be tested easily by unit test
-        #                 as there is no unit test for s3.create()
-        ## result = self.cloud.create_image(self.context, ec2_instance_id,
-        ##                                  no_reboot=True)
-        ## ec2_image_id = result['imageId']
-        ## created_image = self.cloud.describe_images(self.context,
-        ##                                            [ec2_image_id])
+        def fake_show(meh, context, id):
+            bdm = [dict(snapshot_id=snapshots[0],
+                        volume_size=1,
+                        device_name='sda1',
+                        delete_on_termination=False)]
+            props = dict(kernel_id='cedef40a-ed67-4d10-800e-17455edce175',
+                         ramdisk_id='76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
+                         root_device_name='/dev/sda1',
+                         block_device_mapping=bdm)
+            return dict(id=id,
+                        properties=props,
+                        container_format='ami',
+                        status='active',
+                        is_public=True)
+
+        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+
+        def fake_block_device_mapping_get_all_by_instance(context, inst_id):
+            class BDM(object):
+                def __init__(self):
+                    self.no_device = None
+                    self.values = dict(snapshot_id=snapshots[0],
+                                       volume_id=volumes[0],
+                                       virtual_name=None,
+                                       volume_size=1,
+                                       device_name='sda1',
+                                       delete_on_termination=False)
+
+                def __getattr__(self, name):
+                    return self.values.get(name)
+
+                def __getitem__(self, key):
+                    return self.values.get(key)
+
+            return [BDM()]
+
+        self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
+                       fake_block_device_mapping_get_all_by_instance)
+
+        virt_driver = {}
+
+        def fake_power_on(self, instance):
+            virt_driver['powered_on'] = True
+
+        self.stubs.Set(fake_virt.FakeDriver, 'power_on', fake_power_on)
+
+        def fake_power_off(self, instance):
+            virt_driver['powered_off'] = True
+
+        self.stubs.Set(fake_virt.FakeDriver, 'power_off', fake_power_off)
+
+        result = self.cloud.create_image(self.context, ec2_instance_id,
+                                         no_reboot=no_reboot)
+        ec2_ids = [result['imageId']]
+        created_image = self.cloud.describe_images(self.context,
+                                                   ec2_ids)['imagesSet'][0]
+
+        self.assertTrue('blockDeviceMapping' in created_image)
+        bdm = created_image['blockDeviceMapping'][0]
+        self.assertEquals(bdm.get('deviceName'), 'sda1')
+        self.assertTrue('ebs' in bdm)
+        self.assertEquals(bdm['ebs'].get('snapshotId'),
+                          'snap-%08x' % snapshots[0])
+        self.assertEquals(created_image.get('kernelId'), 'aki-00000001')
+        self.assertEquals(created_image.get('ramdiskId'), 'ari-00000002')
+        self.assertEquals(created_image.get('rootDeviceType'), 'ebs')
+        self.assertNotEqual(virt_driver.get('powered_on'), no_reboot)
+        self.assertNotEqual(virt_driver.get('powered_off'), no_reboot)
 
         self.cloud.terminate_instances(self.context, [ec2_instance_id])
         for vol in volumes:
@@ -2187,6 +2267,58 @@ class CloudTestCase(test.TestCase):
         # TODO(yamahata): clean up snapshot created by CreateImage.
 
         self._restart_compute_service()
+
+    def test_create_image_no_reboot(self):
+        """Make sure that CreateImage works"""
+        self._do_test_create_image(True)
+
+    def test_create_image_with_reboot(self):
+        """Make sure that CreateImage works"""
+        self._do_test_create_image(False)
+
+    def test_create_image_instance_store(self):
+        """
+        Ensure CreateImage fails as expected for an instance-store-backed
+        instance
+        """
+        # enforce periodic tasks run in short time to avoid wait for 60s.
+        self._restart_compute_service(periodic_interval=0.3)
+
+        (volumes, snapshots) = self._setUpImageSet(
+            create_volumes_and_snapshots=True)
+
+        kwargs = {'image_id': 'ami-1',
+                  'instance_type': FLAGS.default_instance_type,
+                  'max_count': 1}
+        ec2_instance_id = self._run_instance(**kwargs)
+
+        def fake_block_device_mapping_get_all_by_instance(context, inst_id):
+            class BDM(object):
+                def __init__(self):
+                    self.no_device = None
+                    self.values = dict(snapshot_id=snapshots[0],
+                                       volume_id=volumes[0],
+                                       virtual_name=None,
+                                       volume_size=1,
+                                       device_name='vda',
+                                       delete_on_termination=False)
+
+                def __getattr__(self, name):
+                    return self.values.get(name)
+
+                def __getitem__(self, key):
+                    return self.values.get(key)
+
+            return [BDM()]
+
+        self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
+                       fake_block_device_mapping_get_all_by_instance)
+
+        self.assertRaises(exception.InvalidParameterValue,
+                          self.cloud.create_image,
+                          self.context,
+                          ec2_instance_id,
+                          no_reboot=True)
 
     @staticmethod
     def _fake_bdm_get(ctxt, id):
@@ -2369,6 +2501,7 @@ class CloudTestCase(test.TestCase):
 
             return {
                 'id': id_,
+                'name': 'fake_name',
                 'properties': prop_base,
                 'container_format': 'ami',
                 'status': 'active'}

@@ -35,10 +35,6 @@ def create_cow_image(backing_file, path):
     pass
 
 
-def get_disk_size(path):
-    return disk_sizes.get(path, 1024 * 1024 * 20)
-
-
 def get_disk_backing_file(path):
     return disk_backing_files.get(path, None)
 
@@ -108,7 +104,7 @@ def file_open(path, mode=None):
 
 def load_file(path):
     if os.path.exists(path):
-        with open(path, 'r+') as fp:
+        with open(path, 'r') as fp:
             return fp.read()
     else:
         return ''

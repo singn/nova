@@ -145,6 +145,31 @@ def remove_logical_volumes(*paths):
         execute(*lvremove, attempts=3, run_as_root=True)
 
 
+def pick_disk_driver_name(is_block_dev=False):
+    """Pick the libvirt primary backend driver name
+
+    If the hypervisor supports multiple backend drivers, then the name
+    attribute selects the primary backend driver name, while the optional
+    type attribute provides the sub-type.  For example, xen supports a name
+    of "tap", "tap2", "phy", or "file", with a type of "aio" or "qcow2",
+    while qemu only supports a name of "qemu", but multiple types including
+    "raw", "bochs", "qcow2", and "qed".
+
+    :param is_block_dev:
+    :returns: driver_name or None
+    """
+    if FLAGS.libvirt_type == "xen":
+        if is_block_dev:
+            return "phy"
+        else:
+            return "tap"
+    elif FLAGS.libvirt_type in ('kvm', 'qemu'):
+        return "qemu"
+    else:
+        # UML doesn't want a driver_name set
+        return None
+
+
 def get_disk_size(path):
     """Get the (virtual) size of a disk image
 
@@ -152,10 +177,9 @@ def get_disk_size(path):
     :returns: Size (in bytes) of the given disk image as it would be seen
               by a virtual machine.
     """
-    out, err = execute('qemu-img', 'info', path)
-    size = [i.split('(')[1].split()[0] for i in out.split('\n')
-        if i.strip().find('virtual size') >= 0]
-    return int(size[0])
+    size = images.qemu_img_info(path)['virtual size']
+    size = size.split('(')[1].split()[0]
+    return int(size)
 
 
 def get_disk_backing_file(path):
@@ -164,33 +188,45 @@ def get_disk_backing_file(path):
     :param path: Path to the disk image
     :returns: a path to the image's backing store
     """
-    out, err = execute('qemu-img', 'info', path)
-    backing_file = None
+    backing_file = images.qemu_img_info(path).get('backing file')
 
-    for line in out.split('\n'):
-        if line.startswith('backing file: '):
-            if 'actual path: ' in line:
-                backing_file = line.split('actual path: ')[1][:-1]
-            else:
-                backing_file = line.split('backing file: ')[1]
-            break
     if backing_file:
+        if 'actual path: ' in backing_file:
+            backing_file = backing_file.split('actual path: ')[1][:-1]
         backing_file = os.path.basename(backing_file)
 
     return backing_file
 
 
-def copy_image(src, dest):
-    """Copy a disk image
+def copy_image(src, dest, host=None):
+    """Copy a disk image to an existing directory
 
     :param src: Source image
     :param dest: Destination path
+    :param host: Remote host
     """
-    # We shell out to cp because that will intelligently copy
-    # sparse files.  I.E. holes will not be written to DEST,
-    # rather recreated efficiently.  In addition, since
-    # coreutils 8.11, holes can be read efficiently too.
-    execute('cp', src, dest)
+
+    if not host:
+        # We shell out to cp because that will intelligently copy
+        # sparse files.  I.E. holes will not be written to DEST,
+        # rather recreated efficiently.  In addition, since
+        # coreutils 8.11, holes can be read efficiently too.
+        execute('cp', src, dest)
+    else:
+        dest = "%s:%s" % (host, dest)
+        # Try rsync first as that can compress and create sparse dest files.
+        # Note however that rsync currently doesn't read sparse files
+        # efficiently: https://bugzilla.samba.org/show_bug.cgi?id=8918
+        # At least network traffic is mitigated with compression.
+        try:
+            # Do a relatively light weight test first, so that we
+            # can fall back to scp, without having run out of space
+            # on the destination for example.
+            execute('rsync', '--sparse', '--compress', '--dry-run', src, dest)
+        except exception.ProcessExecutionError:
+            execute('scp', src, dest)
+        else:
+            execute('rsync', '--sparse', '--compress', src, dest)
 
 
 def mkfs(fs, path, label=None):
@@ -286,6 +322,9 @@ def extract_snapshot(disk_path, source_fmt, snapshot_name, out_path, dest_fmt):
     :param snapshot_name: Name of snapshot in disk image
     :param out_path: Desired path of extracted snapshot
     """
+    # NOTE(markmc): ISO is just raw to qemu-img
+    if dest_fmt == 'iso':
+        dest_fmt = 'raw'
     qemu_img_cmd = ('qemu-img',
                     'convert',
                     '-f',
@@ -304,7 +343,7 @@ def load_file(path):
 
     :param path: File to read
     """
-    with open(path, 'r+') as fp:
+    with open(path, 'r') as fp:
         return fp.read()
 
 

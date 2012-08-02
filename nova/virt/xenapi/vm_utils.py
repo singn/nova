@@ -2,6 +2,7 @@
 
 # Copyright (c) 2010 Citrix Systems, Inc.
 # Copyright 2011 Piston Cloud Computing, Inc.
+# Copyright 2012 Openstack, LLC.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -139,7 +140,8 @@ class ImageType(object):
         return dict(zip(ImageType._strs, ImageType._ids)).get(image_type_str)
 
 
-def create_vm(session, instance, kernel, ramdisk, use_pv_kernel=False):
+def create_vm(session, instance, name_label, kernel, ramdisk,
+              use_pv_kernel=False):
     """Create a VM record.  Returns new VM reference.
     the use_pv_kernel flag indicates whether the guest is HVM or PV
 
@@ -151,7 +153,7 @@ def create_vm(session, instance, kernel, ramdisk, use_pv_kernel=False):
 
         3. Using hardware virtualization
     """
-    inst_type_id = instance.instance_type_id
+    inst_type_id = instance['instance_type_id']
     instance_type = instance_types.get_instance_type(inst_type_id)
     mem = str(long(instance_type['memory_mb']) * 1024 * 1024)
     vcpus = str(instance_type['vcpus'])
@@ -173,9 +175,9 @@ def create_vm(session, instance, kernel, ramdisk, use_pv_kernel=False):
         'memory_static_max': mem,
         'memory_target': mem,
         'name_description': '',
-        'name_label': instance.name,
+        'name_label': name_label,
         'other_config': {'allowvssprovider': str(False),
-                         'nova_uuid': str(instance.uuid)},
+                         'nova_uuid': str(instance['uuid'])},
         'PCI_bus': '',
         'platform': {'acpi': 'true', 'apic': 'true', 'pae': 'true',
                      'viridian': 'true', 'timeoffset': '0'},
@@ -197,7 +199,7 @@ def create_vm(session, instance, kernel, ramdisk, use_pv_kernel=False):
     # non-raw/raw with PV kernel/raw in HVM mode
     if use_pv_kernel:
         rec['platform']['nx'] = 'false'
-        if instance.kernel_id:
+        if instance['kernel_id']:
             # 1. Kernel explicitly passed in, use that
             rec['PV_args'] = 'root=/dev/xvda1'
             rec['PV_kernel'] = kernel
@@ -246,7 +248,7 @@ def shutdown_vm(session, instance, vm_ref, hard=True):
 
 
 def ensure_free_mem(session, instance):
-    inst_type_id = instance.instance_type_id
+    inst_type_id = instance['instance_type_id']
     instance_type = instance_types.get_instance_type(inst_type_id)
     mem = long(instance_type['memory_mb']) * 1024 * 1024
     host = session.get_xenapi_host()
@@ -353,18 +355,14 @@ def safe_destroy_vdis(session, vdi_refs):
             LOG.error(exc)
 
 
-def create_vdi(session, sr_ref, info, disk_type, virtual_size,
+def create_vdi(session, sr_ref, instance, name_label, disk_type, virtual_size,
                read_only=False):
     """Create a VDI record and returns its reference."""
     # create_vdi may be called simply while creating a volume
     # hence information about instance may or may not be present
-    otherconf = {}
-    if not isinstance(info, basestring):
-        name_label = info['name']
-        otherconf = {'nova_instance_uuid': info['uuid'],
-                     'nova_disk_type': disk_type}
-    else:
-        name_label = info
+    otherconf = {'nova_disk_type': disk_type}
+    if instance:
+        otherconf['nova_instance_uuid'] = instance['uuid']
     vdi_ref = session.call_xenapi("VDI.create",
          {'name_label': name_label,
           'name_description': disk_type,
@@ -412,9 +410,8 @@ def _volume_in_mapping(mount_device, block_device_info):
     return block_device.strip_prefix(mount_device) in block_device_list
 
 
-def get_vdis_for_instance(context, session, instance, image,
-                          image_type,
-                          block_device_info=None):
+def get_vdis_for_instance(context, session, instance, name_label, image,
+                          image_type, block_device_info=None):
     if block_device_info:
         LOG.debug(_("block device info: %s"), block_device_info)
         rootdev = block_device_info['root_device_name']
@@ -428,15 +425,67 @@ def get_vdis_for_instance(context, session, instance, image,
             return get_vdis_for_boot_from_vol(session,
                                              instance,
                                              dev_params)
-    return create_image(context, session, instance, image,
+    return _create_image(context, session, instance, name_label, image,
                         image_type)
 
 
-def _copy_vdi(session, sr_ref, vdi_to_copy_ref):
-    """Copy a VDI and return the new VDIs reference."""
-    vdi_ref = session.call_xenapi('VDI.copy', vdi_to_copy_ref, sr_ref)
-    LOG.debug(_('Copied VDI %(vdi_ref)s from VDI '
-                '%(vdi_to_copy_ref)s on %(sr_ref)s.') % locals())
+@contextlib.contextmanager
+def _dummy_vm(session, instance, vdi_ref):
+    """This creates a temporary VM so that we can snapshot a VDI.
+
+    VDI's can't be snapshotted directly since the API expects a `vm_ref`. To
+    work around this, we need to create a temporary VM and then map the VDI to
+    the VM using a temporary VBD.
+    """
+    name_label = "dummy"
+    vm_ref = create_vm(session, instance, name_label, None, None)
+    try:
+        vbd_ref = create_vbd(session, vm_ref, vdi_ref, 'autodetect',
+                             read_only=True)
+        try:
+            yield vm_ref
+        finally:
+            try:
+                destroy_vbd(session, vbd_ref)
+            except volume_utils.StorageError:
+                # destroy_vbd() will log error
+                pass
+    finally:
+        destroy_vm(session, instance, vm_ref)
+
+
+def _safe_copy_vdi(session, sr_ref, instance, vdi_to_copy_ref):
+    """Copy a VDI and return the new VDIs reference.
+
+    This function differs from the XenAPI `VDI.copy` call in that the copy is
+    atomic and isolated, meaning we don't see half-downloaded images. It
+    accomplishes this by copying the VDI's into a temporary directory and then
+    atomically renaming them into the SR when the copy is completed.
+
+    The correct long term solution is to fix `VDI.copy` so that it is atomic
+    and isolated.
+    """
+    with _dummy_vm(session, instance, vdi_to_copy_ref) as vm_ref:
+        label = "snapshot"
+
+        with snapshot_attached_here(
+                session, instance, vm_ref, label) as vdi_uuids:
+            params = {'sr_path': get_sr_path(session),
+                      'vdi_uuids': vdi_uuids,
+                      'uuid_stack': _make_uuid_stack()}
+
+            kwargs = {'params': pickle.dumps(params)}
+            result = session.call_plugin(
+                    'workarounds', 'safe_copy_vdis', kwargs)
+            imported_vhds = jsonutils.loads(result)
+
+    root_uuid = imported_vhds['root']['uuid']
+
+    # TODO(sirp): for safety, we should probably re-scan the SR after every
+    # call to a dom0 plugin, since there is a possibility that the underlying
+    # VHDs changed
+    scan_default_sr(session)
+    vdi_ref = session.call_xenapi('VDI.get_by_uuid', root_uuid)
     return vdi_ref
 
 
@@ -471,45 +520,35 @@ def get_vdi_for_vm_safely(session, vm_ref):
 def snapshot_attached_here(session, instance, vm_ref, label):
     LOG.debug(_("Starting snapshot for VM"), instance=instance)
 
-    try:
-        template_vm_ref, vdi_uuids = _create_snapshot(
-                session, instance, vm_ref, label)
-    except session.XenAPI.Failure, exc:
-        LOG.error(_("Unable to Snapshot instance: %(exc)s"), locals(),
-                  instance=instance)
-        raise
+    # Memorize the original_parent_uuid so we can poll for coalesce
+    vm_vdi_ref, vm_vdi_rec = get_vdi_for_vm_safely(session, vm_ref)
+    original_parent_uuid = _get_vhd_parent_uuid(session, vm_vdi_ref)
+
+    template_vm_ref, template_vdi_uuid = _create_snapshot(
+            session, instance, vm_ref, label)
 
     try:
+        sr_ref = vm_vdi_rec["SR"]
+        parent_uuid, base_uuid = _wait_for_vhd_coalesce(
+                session, instance, sr_ref, vm_vdi_ref, original_parent_uuid)
+
+        vdi_uuids = [vdi_rec['uuid'] for vdi_rec in
+                     _walk_vdi_chain(session, template_vdi_uuid)]
+
         yield vdi_uuids
     finally:
         _destroy_snapshot(session, instance, template_vm_ref)
 
 
 def _create_snapshot(session, instance, vm_ref, label):
-    """Creates Snapshot (Template) VM, Snapshot VBD, Snapshot VDI,
-    Snapshot VHD"""
-    LOG.debug(_("Snapshotting with label '%(label)s'"), locals(),
-              instance=instance)
-
-    vm_vdi_ref, vm_vdi_rec = get_vdi_for_vm_safely(session, vm_ref)
-
-    original_parent_uuid = _get_vhd_parent_uuid(session, vm_vdi_ref)
-
     template_vm_ref = session.call_xenapi('VM.snapshot', vm_ref, label)
     template_vdi_rec = get_vdi_for_vm_safely(session, template_vm_ref)[1]
     template_vdi_uuid = template_vdi_rec["uuid"]
 
-    LOG.debug(_('Created snapshot %(template_vm_ref)s'), locals(),
-              instance=instance)
+    LOG.debug(_("Created snapshot %(template_vdi_uuid)s with label"
+                " '%(label)s'"), locals(), instance=instance)
 
-    sr_ref = vm_vdi_rec["SR"]
-    parent_uuid, base_uuid = _wait_for_vhd_coalesce(
-            session, instance, sr_ref, vm_vdi_ref, original_parent_uuid)
-
-    vdi_uuids = [vdi_rec['uuid'] for vdi_rec in
-                 _walk_vdi_chain(session, template_vdi_uuid)]
-
-    return template_vm_ref, vdi_uuids
+    return template_vm_ref, template_vdi_uuid
 
 
 def _destroy_snapshot(session, instance, vm_ref):
@@ -531,29 +570,73 @@ def get_sr_path(session):
     return os.path.join(FLAGS.xenapi_sr_base_path, sr_uuid)
 
 
-def find_cached_image(session, image_id, sr_ref):
-    """Returns the vdi-ref of the cached image."""
+def destroy_cached_images(session, sr_ref, all_cached=False, dry_run=False):
+    """Destroy used or unused cached images.
+
+    A cached image that is being used by at least one VM is said to be 'used'.
+
+    In the case of an 'unused' image, the cached image will be the only
+    descendent of the base-copy. So when we delete the cached-image, the
+    refcount will drop to zero and XenServer will automatically destroy the
+    base-copy for us.
+
+    The default behavior of this function is to destroy only 'unused' cached
+    images. To destroy all cached images, use the `all_cached=True` kwarg.
+    """
+    cached_images = _find_cached_images(session, sr_ref)
+    destroyed = set()
+
+    def destroy_cached_vdi(vdi_uuid, vdi_ref):
+        LOG.debug(_("Destroying cached VDI '%(vdi_uuid)s'"))
+        if not dry_run:
+            destroy_vdi(session, vdi_ref)
+        destroyed.add(vdi_uuid)
+
+    for vdi_ref in cached_images.values():
+        vdi_uuid = session.call_xenapi('VDI.get_uuid', vdi_ref)
+
+        if all_cached:
+            destroy_cached_vdi(vdi_uuid, vdi_ref)
+            continue
+
+        # Unused-Only: Search for siblings
+
+        # Chain length greater than two implies a VM must be holding a ref to
+        # the base-copy (otherwise it would have coalesced), so consider this
+        # cached image used.
+        chain = list(_walk_vdi_chain(session, vdi_uuid))
+        if len(chain) > 2:
+            continue
+        elif len(chain) == 2:
+            # Siblings imply cached image is used
+            root_vdi_rec = chain[-1]
+            children = _child_vhds(session, sr_ref, root_vdi_rec['uuid'])
+            if len(children) > 1:
+                continue
+
+        destroy_cached_vdi(vdi_uuid, vdi_ref)
+
+    return destroyed
+
+
+def _find_cached_images(session, sr_ref):
+    """Return a dict(uuid=vdi_ref) representing all cached images."""
+    cached_images = {}
     for vdi_ref, vdi_rec in _get_all_vdis_in_sr(session, sr_ref):
-        other_config = vdi_rec['other_config']
-
         try:
-            image_id_match = other_config['image-id'] == image_id
+            image_id = vdi_rec['other_config']['image-id']
         except KeyError:
-            image_id_match = False
+            continue
 
-        # NOTE(sirp): `VDI.copy` stores the partially-completed file in the SR.
-        # In order to avoid these half-baked files, we compare its current size
-        # to the expected size pulled from the original cache file.
-        try:
-            size_match = (other_config['expected_physical_utilisation'] ==
-                          vdi_rec['physical_utilisation'])
-        except KeyError:
-            size_match = False
+        cached_images[image_id] = vdi_ref
 
-        if image_id_match and size_match:
-            return vdi_ref
+    return cached_images
 
-    return None
+
+def _find_cached_image(session, image_id, sr_ref):
+    """Returns the vdi-ref of the cached image."""
+    cached_images = _find_cached_images(session, sr_ref)
+    return cached_images.get(image_id)
 
 
 def upload_image(context, session, instance, vdi_uuids, image_id):
@@ -565,17 +648,22 @@ def upload_image(context, session, instance, vdi_uuids, image_id):
     LOG.debug(_("Asking xapi to upload %(vdi_uuids)s as"
                 " ID %(image_id)s"), locals(), instance=instance)
 
-    glance_host, glance_port = glance.pick_glance_api_server()
+    glance_api_servers = glance.get_api_servers()
+    glance_host, glance_port = glance_api_servers.next()
 
+    # TODO(sirp): this inherit-image-property code should probably go in
+    # nova/compute/manager so it can be shared across hypervisors
     sys_meta = db.instance_system_metadata_get(context, instance['uuid'])
     properties = {}
     prefix = 'image_'
     for key, value in sys_meta.iteritems():
         if key.startswith(prefix):
             key = key[len(prefix):]
+        if key in FLAGS.non_inheritable_image_properties:
+            continue
         properties[key] = value
-    properties['auto_disk_config'] = instance.auto_disk_config
-    properties['os_type'] = instance.os_type or FLAGS.default_os_type
+    properties['auto_disk_config'] = instance['auto_disk_config']
+    properties['os_type'] = instance['os_type'] or FLAGS.default_os_type
 
     params = {'vdi_uuids': vdi_uuids,
               'image_id': image_id,
@@ -601,7 +689,10 @@ def resize_disk(session, instance, vdi_ref, instance_type):
 
         # Create new VDI
         vdi_size = instance_type['root_gb'] * 1024 * 1024 * 1024
-        new_ref = create_vdi(session, sr_ref, instance, 'root', vdi_size)
+        # NOTE(johannes): No resizing allowed for rescue instances, so
+        # using instance['name'] is safe here
+        new_ref = create_vdi(session, sr_ref, instance, instance['name'],
+                             'root', vdi_size)
 
         new_uuid = session.call_xenapi('VDI.get_uuid', new_ref)
 
@@ -642,8 +733,8 @@ def auto_configure_disk(session, vdi_ref, new_gb):
             _resize_part_and_fs(dev, start, old_sectors, new_sectors)
 
 
-def _generate_disk(session, instance, vm_ref, userdevice, name, size_mb,
-                   fs_type):
+def _generate_disk(session, instance, vm_ref, userdevice, name_label,
+                   disk_type, size_mb, fs_type):
     """
     Steps to programmatically generate a disk:
 
@@ -659,7 +750,8 @@ def _generate_disk(session, instance, vm_ref, userdevice, name, size_mb,
     sr_ref = safe_find_sr(session)
     ONE_MEG = 1024 * 1024
     virtual_size = size_mb * ONE_MEG
-    vdi_ref = create_vdi(session, sr_ref, instance, name, virtual_size)
+    vdi_ref = create_vdi(session, sr_ref, instance, name_label, disk_type,
+                         virtual_size)
 
     try:
         # 2. Attach VDI to compute worker (VBD hotplug)
@@ -692,23 +784,25 @@ def _generate_disk(session, instance, vm_ref, userdevice, name, size_mb,
             destroy_vdi(session, vdi_ref)
 
 
-def generate_swap(session, instance, vm_ref, userdevice, swap_mb):
+def generate_swap(session, instance, vm_ref, userdevice, name_label, swap_mb):
     # NOTE(jk0): We use a FAT32 filesystem for the Windows swap
     # partition because that is what parted supports.
-    is_windows = instance.os_type == "windows"
+    is_windows = instance['os_type'] == "windows"
     fs_type = "vfat" if is_windows else "linux-swap"
 
-    _generate_disk(session, instance, vm_ref, userdevice, 'swap', swap_mb,
-                   fs_type)
+    _generate_disk(session, instance, vm_ref, userdevice, name_label,
+                   'swap', swap_mb, fs_type)
 
 
-def generate_ephemeral(session, instance, vm_ref, userdevice, size_gb):
-    _generate_disk(session, instance, vm_ref, userdevice, 'ephemeral',
-                   size_gb * 1024, FLAGS.default_ephemeral_format)
+def generate_ephemeral(session, instance, vm_ref, userdevice, name_label,
+                       size_gb):
+    _generate_disk(session, instance, vm_ref, userdevice, name_label,
+                   'ephemeral', size_gb * 1024,
+                   FLAGS.default_ephemeral_format)
 
 
-def create_kernel_image(context, session, instance, image_id, user_id,
-                        project_id, image_type):
+def create_kernel_image(context, session, instance, name_label, image_id,
+                        image_type):
     """Creates kernel/ramdisk file from the image stored in the cache.
     If the image is not present in the cache, it streams it from glance.
 
@@ -722,8 +816,8 @@ def create_kernel_image(context, session, instance, image_id, user_id,
         filename = session.call_plugin('kernel', 'create_kernel_ramdisk', args)
 
     if filename == "":
-        return _fetch_disk_image(context, session, instance, image_id,
-                                 image_type)
+        return _fetch_disk_image(context, session, instance, name_label,
+                                 image_id, image_type)
     else:
         vdi_type = ImageType.to_string(image_type)
         return {vdi_type: dict(uuid=None, file=filename)}
@@ -738,7 +832,8 @@ def destroy_kernel_ramdisk(session, kernel, ramdisk):
     session.call_plugin('kernel', 'remove_kernel_ramdisk', args)
 
 
-def _create_cached_image(context, session, instance, image_id, image_type):
+def _create_cached_image(context, session, instance, name_label,
+                         image_id, image_type):
     sr_ref = safe_find_sr(session)
     sr_type = session.call_xenapi('SR.get_record', sr_ref)["type"]
     vdis = {}
@@ -749,9 +844,10 @@ def _create_cached_image(context, session, instance, image_id, image_type):
                       "type %(sr_type)s. Ignoring the cow flag.")
                       % locals())
 
-    root_vdi_ref = find_cached_image(session, image_id, sr_ref)
+    root_vdi_ref = _find_cached_image(session, image_id, sr_ref)
     if root_vdi_ref is None:
-        vdis = _fetch_image(context, session, instance, image_id, image_type)
+        vdis = _fetch_image(context, session, instance, name_label,
+                            image_id, image_type)
         root_vdi = vdis['root']
         root_vdi_ref = session.call_xenapi('VDI.get_by_uuid',
                                            root_vdi['uuid'])
@@ -760,24 +856,16 @@ def _create_cached_image(context, session, instance, image_id, image_type):
         session.call_xenapi('VDI.add_to_other_config',
                             root_vdi_ref, 'image-id', str(image_id))
 
-        for vdi_type, vdi in vdis.iteritems():
-            vdi_ref = session.call_xenapi('VDI.get_by_uuid',
-                                          vdi['uuid'])
-
-            vdi_rec = session.call_xenapi('VDI.get_record', vdi_ref)
-            session.call_xenapi('VDI.add_to_other_config',
-                                vdi_ref, 'expected_physical_utilisation',
-                                vdi_rec['physical_utilisation'])
-
-            if vdi_type == 'swap':
-                session.call_xenapi('VDI.add_to_other_config',
-                                    root_vdi_ref, 'swap-disk',
-                                    str(vdi['uuid']))
+        swap_vdi = vdis.get('swap')
+        if swap_vdi:
+            session.call_xenapi(
+                    'VDI.add_to_other_config', root_vdi_ref, 'swap-disk',
+                    str(swap_vdi['uuid']))
 
     if FLAGS.use_cow_images and sr_type == 'ext':
         new_vdi_ref = _clone_vdi(session, root_vdi_ref)
     else:
-        new_vdi_ref = _copy_vdi(session, sr_ref, root_vdi_ref)
+        new_vdi_ref = _safe_copy_vdi(session, sr_ref, instance, root_vdi_ref)
 
     # Set the name label for the image we just created and remove image id
     # field from other-config.
@@ -795,7 +883,8 @@ def _create_cached_image(context, session, instance, image_id, image_type):
         swap_disk_uuid = vdi_rec['other_config']['swap-disk']
         swap_vdi_ref = session.call_xenapi('VDI.get_by_uuid',
                                            swap_disk_uuid)
-        new_swap_vdi_ref = _copy_vdi(session, sr_ref, swap_vdi_ref)
+        new_swap_vdi_ref = _safe_copy_vdi(
+                session, sr_ref, instance, swap_vdi_ref)
         new_swap_vdi_uuid = session.call_xenapi('VDI.get_uuid',
                                                 new_swap_vdi_ref)
         vdis['swap'] = dict(uuid=new_swap_vdi_uuid, file=None)
@@ -803,7 +892,8 @@ def _create_cached_image(context, session, instance, image_id, image_type):
     return vdis
 
 
-def create_image(context, session, instance, image_id, image_type):
+def _create_image(context, session, instance, name_label, image_id,
+                  image_type):
     """Creates VDI from the image stored in the local cache. If the image
     is not present in the cache, it streams it from glance.
 
@@ -833,21 +923,21 @@ def create_image(context, session, instance, image_id, image_type):
 
     # Fetch (and cache) the image
     if cache:
-        vdis = _create_cached_image(
-                context, session, instance, image_id, image_type)
+        vdis = _create_cached_image(context, session, instance, name_label,
+                                    image_id, image_type)
     else:
-        vdis = _fetch_image(
-                context, session, instance, image_id, image_type)
+        vdis = _fetch_image(context, session, instance, name_label,
+                            image_id, image_type)
 
     # Set the name label and description to easily identify what
     # instance and disk it's for
     for vdi_type, vdi in vdis.iteritems():
-        set_vdi_name(session, vdi['uuid'], instance.name, vdi_type)
+        set_vdi_name(session, vdi['uuid'], name_label, vdi_type)
 
     return vdis
 
 
-def _fetch_image(context, session, instance, image_id, image_type):
+def _fetch_image(context, session, instance, name_label, image_id, image_type):
     """Fetch image from glance based on image type.
 
     Returns: A single filename if image_type is KERNEL or RAMDISK
@@ -856,8 +946,8 @@ def _fetch_image(context, session, instance, image_id, image_type):
     if image_type == ImageType.DISK_VHD:
         vdis = _fetch_vhd_image(context, session, instance, image_id)
     else:
-        vdis = _fetch_disk_image(context, session, instance, image_id,
-                                 image_type)
+        vdis = _fetch_disk_image(context, session, instance, name_label,
+                                 image_id, image_type)
 
     for vdi_type, vdi in vdis.iteritems():
         vdi_uuid = vdi['uuid']
@@ -897,6 +987,14 @@ def _fetch_using_dom0_plugin_with_retry(context, session, image_id,
     raise exception.CouldNotFetchImage(image_id=image_id)
 
 
+def _make_uuid_stack():
+    # NOTE(sirp): The XenAPI plugins run under Python 2.4
+    # which does not have the `uuid` module. To work around this,
+    # we generate the uuids here (under Python 2.6+) and
+    # pass them as arguments
+    return [str(uuid.uuid4()) for i in xrange(MAX_VDI_CHAIN_SIZE)]
+
+
 def _fetch_vhd_image(context, session, instance, image_id):
     """Tell glance to download an image and put the VHDs into the SR
 
@@ -905,18 +1003,15 @@ def _fetch_vhd_image(context, session, instance, image_id):
     LOG.debug(_("Asking xapi to fetch vhd image %(image_id)s"), locals(),
               instance=instance)
 
-    # NOTE(sirp): The XenAPI plugins run under Python 2.4
-    # which does not have the `uuid` module. To work around this,
-    # we generate the uuids here (under Python 2.6+) and
-    # pass them as arguments
-    uuid_stack = [str(uuid.uuid4()) for i in xrange(MAX_VDI_CHAIN_SIZE)]
     params = {'image_id': image_id,
-              'uuid_stack': uuid_stack,
+              'uuid_stack': _make_uuid_stack(),
               'sr_path': get_sr_path(session),
               'auth_token': getattr(context, 'auth_token', None)}
 
+    glance_api_servers = glance.get_api_servers()
+
     def pick_glance(params):
-        glance_host, glance_port = glance.pick_glance_api_server()
+        glance_host, glance_port = glance_api_servers.next()
         params['glance_host'] = glance_host
         params['glance_port'] = glance_port
 
@@ -932,7 +1027,7 @@ def _fetch_vhd_image(context, session, instance, image_id):
     root_vdi_uuid = vdis['root']['uuid']
 
     # Set the name-label to ease debugging
-    set_vdi_name(session, root_vdi_uuid, instance.name, 'root')
+    set_vdi_name(session, root_vdi_uuid, instance['name'], 'root')
 
     _check_vdi_size(context, session, instance, root_vdi_uuid)
     return vdis
@@ -975,7 +1070,8 @@ def _check_vdi_size(context, session, instance, vdi_uuid):
         raise exception.ImageTooLarge()
 
 
-def _fetch_disk_image(context, session, instance, image_id, image_type):
+def _fetch_disk_image(context, session, instance, name_label, image_id,
+                      image_type):
     """Fetch the image from Glance
 
     NOTE:
@@ -1015,7 +1111,8 @@ def _fetch_disk_image(context, session, instance, image_id, image_type):
             _("Kernel/Ramdisk image is too large: %(vdi_size)d bytes, "
               "max %(max_size)d bytes") % locals())
 
-    vdi_ref = create_vdi(session, sr_ref, instance, image_type_str, vdi_size)
+    vdi_ref = create_vdi(session, sr_ref, instance, name_label,
+                         image_type_str, vdi_size)
     # From this point we have a VDI on Xen host;
     # If anything goes wrong, we need to remember its uuid.
     try:
@@ -1498,47 +1595,52 @@ def _get_all_vdis_in_sr(session, sr_ref):
             continue
 
 
-#TODO(sirp): This code comes from XS5.6 pluginlib.py, we should refactor to
-# use that implmenetation
-def _get_vhd_parent(session, vdi_rec):
-    """
-    Returns the VHD parent of the given VDI record, as a (ref, rec) pair.
-    Returns None if we're at the root of the tree.
-    """
-    if 'vhd-parent' in vdi_rec['sm_config']:
-        parent_uuid = vdi_rec['sm_config']['vhd-parent']
-        parent_ref = session.call_xenapi("VDI.get_by_uuid", parent_uuid)
-        parent_rec = session.call_xenapi("VDI.get_record", parent_ref)
-        vdi_uuid = vdi_rec['uuid']
-        LOG.debug(_("VHD %(vdi_uuid)s has parent %(parent_ref)s") % locals())
-        return parent_ref, parent_rec
-    else:
-        return None
-
-
 def _get_vhd_parent_uuid(session, vdi_ref):
     vdi_rec = session.call_xenapi("VDI.get_record", vdi_ref)
-    ret = _get_vhd_parent(session, vdi_rec)
-    if ret:
-        _parent_ref, parent_rec = ret
-        return parent_rec["uuid"]
-    else:
+
+    if 'vhd-parent' not in vdi_rec['sm_config']:
         return None
+
+    parent_uuid = vdi_rec['sm_config']['vhd-parent']
+    vdi_uuid = vdi_rec['uuid']
+    LOG.debug(_("VHD %(vdi_uuid)s has parent %(parent_uuid)s") % locals())
+    return parent_uuid
 
 
 def _walk_vdi_chain(session, vdi_uuid):
     """Yield vdi_recs for each element in a VDI chain"""
-    # TODO(jk0): perhaps make _get_vhd_parent use this
+    scan_default_sr(session)
     while True:
         vdi_ref = session.call_xenapi("VDI.get_by_uuid", vdi_uuid)
         vdi_rec = session.call_xenapi("VDI.get_record", vdi_ref)
         yield vdi_rec
 
-        parent_uuid = vdi_rec['sm_config'].get('vhd-parent')
-        if parent_uuid:
-            vdi_uuid = parent_uuid
-        else:
+        parent_uuid = _get_vhd_parent_uuid(session, vdi_ref)
+        if not parent_uuid:
             break
+
+        vdi_uuid = parent_uuid
+
+
+def _child_vhds(session, sr_ref, vdi_uuid):
+    """Return the immediate children of a given VHD.
+
+    This is not recursive, only the immediate children are returned.
+    """
+    children = set()
+    for ref, rec in _get_all_vdis_in_sr(session, sr_ref):
+        rec_uuid = rec['uuid']
+
+        if rec_uuid == vdi_uuid:
+            continue
+
+        parent_uuid = _get_vhd_parent_uuid(session, ref)
+        if parent_uuid != vdi_uuid:
+            continue
+
+        children.add(rec_uuid)
+
+    return children
 
 
 def _wait_for_vhd_coalesce(session, instance, sr_ref, vdi_ref,
@@ -1578,6 +1680,10 @@ def _wait_for_vhd_coalesce(session, instance, sr_ref, vdi_ref,
         parent_ref = session.call_xenapi("VDI.get_by_uuid", parent_uuid)
         base_uuid = _get_vhd_parent_uuid(session, parent_ref)
         return parent_uuid, base_uuid
+
+    # NOTE(sirp): This rescan is necessary to ensure the VM's `sm_config`
+    # matches the underlying VHDs.
+    _scan_sr(session, sr_ref)
 
     max_attempts = FLAGS.xenapi_vhd_coalesce_max_attempts
     for i in xrange(max_attempts):
@@ -2049,3 +2155,26 @@ def ensure_correct_host(session):
             raise
         raise Exception(_('This domU must be running on the host '
                           'specified by xenapi_connection_url'))
+
+
+def move_disks(session, instance, disk_info):
+    """Move and possibly link VHDs via the XAPI plugin."""
+    params = {'instance_uuid': instance['uuid'],
+              'sr_path': get_sr_path(session),
+              'uuid_stack': _make_uuid_stack()}
+
+    result = session.call_plugin(
+            'migration', 'move_vhds_into_sr', {'params': pickle.dumps(params)})
+    imported_vhds = jsonutils.loads(result)
+
+    # Now we rescan the SR so we find the VHDs
+    scan_default_sr(session)
+
+    # Set name-label so we can find if we need to clean up a failed
+    # migration
+    root_uuid = imported_vhds['root']['uuid']
+    set_vdi_name(session, root_uuid, instance['name'], 'root')
+
+    root_vdi_ref = session.call_xenapi('VDI.get_by_uuid', root_uuid)
+
+    return {'uuid': root_uuid, 'ref': root_vdi_ref}

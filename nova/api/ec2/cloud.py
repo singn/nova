@@ -1303,8 +1303,10 @@ class CloudController(object):
         properties = image['properties']
         root_device_name = block_device.properties_root_device_name(properties)
         root_device_type = 'instance-store'
+
         for bdm in properties.get('block_device_mapping', []):
-            if (bdm.get('device_name') == root_device_name and
+            if (block_device.strip_dev(bdm.get('device_name')) ==
+                block_device.strip_dev(root_device_name) and
                 ('snapshot_id' in bdm or 'volume_id' in bdm) and
                 not bdm.get('no_device')):
                 root_device_type = 'ebs'
@@ -1387,10 +1389,26 @@ class CloudController(object):
             if result['rootDeviceName'] is None:
                 result['rootDeviceName'] = block_device.DEFAULT_ROOT_DEV_NAME
 
+        def _kernel_attribute(image, result):
+            kernel_id = image['properties'].get('kernel_id')
+            if kernel_id:
+                result['kernel'] = {
+                    'value': ec2utils.image_ec2_id(kernel_id, 'aki')
+                }
+
+        def _ramdisk_attribute(image, result):
+            ramdisk_id = image['properties'].get('ramdisk_id')
+            if ramdisk_id:
+                result['ramdisk'] = {
+                    'value': ec2utils.image_ec2_id(ramdisk_id, 'ari')
+                }
+
         supported_attributes = {
             'blockDeviceMapping': _block_device_mapping_attribute,
             'launchPermission': _launch_permission_attribute,
             'rootDeviceName': _root_device_name_attribute,
+            'kernel': _kernel_attribute,
+            'ramdisk': _ramdisk_attribute,
             }
 
         fn = supported_attributes.get(attribute)
@@ -1449,10 +1467,22 @@ class CloudController(object):
         # NOTE(yamahata): name/description are ignored by register_image(),
         #                 do so here
         no_reboot = kwargs.get('no_reboot', False)
+        name = kwargs.get('name')
         validate_ec2_id(instance_id)
         ec2_instance_id = instance_id
         instance_id = ec2utils.ec2_id_to_id(ec2_instance_id)
         instance = self.compute_api.get(context, instance_id)
+
+        bdms = self.compute_api.get_instance_bdms(context, instance)
+
+        # CreateImage only supported for the analogue of EBS-backed instances
+        if not self.compute_api.is_volume_backed_instance(context, instance,
+                                                          bdms):
+            root = instance['root_device_name']
+            msg = _("Invalid value '%(ec2_instance_id)s' for instanceId. "
+                    "Instance does not have a volume attached at root "
+                    "(%(root)s)") % locals()
+            raise exception.InvalidParameterValue(err=msg)
 
         # stop the instance if necessary
         restart_instance = False
@@ -1481,14 +1511,20 @@ class CloudController(object):
                     raise exception.EC2APIError(
                         _('Couldn\'t stop instance with in %d sec') % timeout)
 
-        src_image = self._get_image(context, instance['image_ref'])
-        properties = src_image['properties']
+        glance_uuid = instance['image_ref']
+        ec2_image_id = ec2utils.glance_id_to_ec2_id(context, glance_uuid)
+        src_image = self._get_image(context, ec2_image_id)
+        new_image = dict(src_image)
+        properties = new_image['properties']
         if instance['root_device_name']:
             properties['root_device_name'] = instance['root_device_name']
 
+        # meaningful image name
+        name_map = dict(instance=instance['uuid'], now=timeutils.isotime())
+        new_image['name'] = (name or
+                             _('image of %(instance)s at %(now)s') % name_map)
+
         mapping = []
-        bdms = db.block_device_mapping_get_all_by_instance(context,
-                                                           instance_id)
         for bdm in bdms:
             if bdm.no_device:
                 continue
@@ -1501,15 +1537,16 @@ class CloudController(object):
                     m[attr] = val
 
             volume_id = m.get('volume_id')
-            if m.get('snapshot_id') and volume_id:
+            snapshot_id = m.get('snapshot_id')
+            if snapshot_id and volume_id:
                 # create snapshot based on volume_id
                 volume = self.volume_api.get(context, volume_id)
                 # NOTE(yamahata): Should we wait for snapshot creation?
                 #                 Linux LVM snapshot creation completes in
                 #                 short time, it doesn't matter for now.
+                name = _('snapshot for %s') % new_image['name']
                 snapshot = self.volume_api.create_snapshot_force(
-                        context, volume, volume['display_name'],
-                        volume['display_description'])
+                        context, volume, name, volume['display_description'])
                 m['snapshot_id'] = snapshot['id']
                 del m['volume_id']
 
@@ -1536,14 +1573,30 @@ class CloudController(object):
             properties['block_device_mapping'] = mapping
 
         for attr in ('status', 'location', 'id'):
-            src_image.pop(attr, None)
+            new_image.pop(attr, None)
 
-        image_id = self._register_image(context, src_image)
+        # the new image is simply a bucket of properties (particularly the
+        # block device mapping, kernel and ramdisk IDs) with no image data,
+        # hence the zero size
+        new_image['size'] = 0
+
+        def _unmap_id_property(properties, name):
+            if properties[name]:
+                properties[name] = ec2utils.id_to_glance_id(context,
+                                                            properties[name])
+
+        # ensure the ID properties are unmapped back to the glance UUID
+        _unmap_id_property(properties, 'kernel_id')
+        _unmap_id_property(properties, 'ramdisk_id')
+
+        new_image = self.image_service.service.create(context, new_image,
+                                                      data='')
+        ec2_id = ec2utils.glance_id_to_ec2_id(context, new_image['id'])
 
         if restart_instance:
-            self.compute_api.start(context, instance_id=instance_id)
+            self.compute_api.start(context, instance)
 
-        return {'imageId': image_id}
+        return {'imageId': ec2_id}
 
 
 class CloudSecurityGroupAPI(compute.api.SecurityGroupAPI):

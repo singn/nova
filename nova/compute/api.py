@@ -18,8 +18,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Handles all requests relating to compute resources (e.g. guest vms,
-networking and storage of vms, and compute hosts on which they run)."""
+"""Handles all requests relating to compute resources (e.g. guest VMs,
+networking and storage of VMs, and compute hosts on which they run)."""
 
 import functools
 import re
@@ -28,7 +28,6 @@ import time
 import urllib
 
 from nova import block_device
-from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
@@ -130,6 +129,15 @@ class API(base.Base):
         self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         super(API, self).__init__(**kwargs)
+
+    def _instance_update(self, context, instance_uuid, **kwargs):
+        """Update an instance in the database using kwargs as value."""
+
+        (old_ref, instance_ref) = self.db.instance_update_and_get_original(
+                context, instance_uuid, kwargs)
+        notifications.send_update(context, old_ref, instance_ref)
+
+        return instance_ref
 
     def _check_injected_file_quota(self, context, injected_files):
         """Enforce quota limits on injected files.
@@ -323,6 +331,7 @@ class API(base.Base):
             return value
 
         options_from_image = {'os_type': prop('os_type'),
+                              'architecture': prop('arch'),
                               'vm_mode': prop('vm_mode')}
 
         # If instance doesn't have auto_disk_config overridden by request, use
@@ -825,8 +834,7 @@ class API(base.Base):
         return dict(instance_ref.iteritems())
 
     @wrap_check_policy
-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
-                                    vm_states.ERROR])
+    @check_instance_state(vm_state=None, task_state=None)
     def soft_delete(self, context, instance):
         """Terminate an instance."""
         LOG.debug(_('Going to try to soft delete instance'),
@@ -1161,7 +1169,7 @@ class API(base.Base):
 
         notifications.send_update_with_states(context, instance, old_vm_state,
                 instance["vm_state"], old_task_state, instance["task_state"],
-                service="api")
+                service="api", verify_states=True)
 
         properties = {
             'instance_uuid': instance_uuid,
@@ -1340,8 +1348,6 @@ class API(base.Base):
 
         self.db.migration_update(context, migration_ref['id'],
                 {'status': 'confirmed'})
-        self.db.instance_update(context, instance['uuid'],
-                {'host': migration_ref['dest_compute'], })
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED],
@@ -1503,8 +1509,9 @@ class API(base.Base):
                     instance,
                     task_state=task_states.UPDATING_PASSWORD)
 
-        self.compute_rpcapi.set_admin_password(context, instance=instance,
-                new_pass=password)
+        self.compute_rpcapi.set_admin_password(context,
+                                               instance=instance,
+                                               new_pass=password)
 
     @wrap_check_policy
     def inject_file(self, context, instance, path, file_contents):
@@ -1533,12 +1540,18 @@ class API(base.Base):
     @wrap_check_policy
     def lock(self, context, instance):
         """Lock the given instance."""
-        self.compute_rpcapi.lock_instance(context, instance=instance)
+        context = context.elevated()
+        instance_uuid = instance['uuid']
+        LOG.debug(_('Locking'), context=context, instance_uuid=instance_uuid)
+        self._instance_update(context, instance_uuid, locked=True)
 
     @wrap_check_policy
     def unlock(self, context, instance):
         """Unlock the given instance."""
-        self.compute_rpcapi.unlock_instance(context, instance=instance)
+        context = context.elevated()
+        instance_uuid = instance['uuid']
+        LOG.debug(_('Unlocking'), context=context, instance_uuid=instance_uuid)
+        self._instance_update(context, instance_uuid, locked=False)
 
     @wrap_check_policy
     def get_lock(self, context, instance):
@@ -1596,6 +1609,9 @@ class API(base.Base):
     def delete_instance_metadata(self, context, instance, key):
         """Delete the given metadata item from an instance."""
         self.db.instance_metadata_delete(context, instance['uuid'], key)
+        self.compute_rpcapi.change_instance_metadata(context,
+                                                     instance=instance,
+                                                     diff={key: ['-']})
 
     @wrap_check_policy
     def update_instance_metadata(self, context, instance,
@@ -1606,15 +1622,20 @@ class API(base.Base):
         `metadata` argument will be deleted.
 
         """
+        orig = self.get_instance_metadata(context, instance)
         if delete:
             _metadata = metadata
         else:
-            _metadata = self.get_instance_metadata(context, instance)
+            _metadata = orig.copy()
             _metadata.update(metadata)
 
         self._check_metadata_properties_quota(context, _metadata)
         self.db.instance_metadata_update(context, instance['uuid'],
                                          _metadata, True)
+        diff = utils.diff_dict(orig, _metadata)
+        self.compute_rpcapi.change_instance_metadata(context,
+                                                     instance=instance,
+                                                     diff=diff)
         return _metadata
 
     def get_instance_faults(self, context, instances):
@@ -1633,6 +1654,15 @@ class API(base.Base):
         """Get all bdm tables for specified instance."""
         return self.db.block_device_mapping_get_all_by_instance(context,
                 instance['uuid'])
+
+    def is_volume_backed_instance(self, context, instance, bdms):
+        bdms = bdms or self.get_instance_bdms(context, instance)
+        for bdm in bdms:
+            if (block_device.strip_dev(bdm.device_name) ==
+                block_device.strip_dev(instance['root_device_name'])):
+                return True
+        else:
+            return False
 
     @check_instance_state(vm_state=[vm_states.ACTIVE])
     def live_migrate(self, context, instance, block_migration,
@@ -1709,7 +1739,7 @@ class AggregateAPI(base.Base):
         return self._get_aggregate_info(context, aggregate)
 
     def get_aggregate_list(self, context):
-        """Get all the aggregates for this zone."""
+        """Get all the aggregates."""
         aggregates = self.db.aggregate_get_all(context)
         return [self._get_aggregate_info(context, a) for a in aggregates]
 
@@ -1723,11 +1753,6 @@ class AggregateAPI(base.Base):
 
         If a key is set to None, it gets removed from the aggregate metadata.
         """
-        # As a first release of the host aggregates blueprint, this call is
-        # pretty dumb, in the sense that interacts only with the model.
-        # In later releasses, updating metadata may trigger virt actions like
-        # the setup of shared storage, or more generally changes to the
-        # underlying hypervisor pools.
         for key in metadata.keys():
             if not metadata[key]:
                 try:
@@ -1752,52 +1777,26 @@ class AggregateAPI(base.Base):
         """Adds the host to an aggregate."""
         # validates the host; ComputeHostNotFound is raised if invalid
         service = self.db.service_get_all_compute_by_host(context, host)[0]
-        # add host, and reflects action in the aggregate operational state
         aggregate = self.db.aggregate_get(context, aggregate_id)
-        if aggregate.operational_state in [aggregate_states.CREATED,
-                                           aggregate_states.ACTIVE]:
-            if service.availability_zone != aggregate.availability_zone:
-                raise exception.InvalidAggregateAction(
-                        action='add host',
-                        aggregate_id=aggregate_id,
-                        reason='availibility zone mismatch')
-            self.db.aggregate_host_add(context, aggregate_id, host)
-            if aggregate.operational_state == aggregate_states.CREATED:
-                values = {'operational_state': aggregate_states.CHANGING}
-                self.db.aggregate_update(context, aggregate_id, values)
-            self.compute_rpcapi.add_aggregate_host(context,
-                    aggregate_id=aggregate_id, host_param=host, host=host)
-            return self.get_aggregate(context, aggregate_id)
-        else:
-            invalid = {aggregate_states.CHANGING: 'setup in progress',
-                       aggregate_states.DISMISSED: 'aggregate deleted',
-                       aggregate_states.ERROR: 'aggregate in error', }
-            if aggregate.operational_state in invalid.keys():
-                raise exception.InvalidAggregateAction(
-                        action='add host',
-                        aggregate_id=aggregate_id,
-                        reason=invalid[aggregate.operational_state])
+        if service.availability_zone != aggregate.availability_zone:
+            raise exception.InvalidAggregateAction(
+                    action='add host',
+                    aggregate_id=aggregate_id,
+                    reason='availability zone mismatch')
+        self.db.aggregate_host_add(context, aggregate_id, host)
+        #NOTE(jogo): Send message to host to support resource pools
+        self.compute_rpcapi.add_aggregate_host(context,
+                aggregate_id=aggregate_id, host_param=host, host=host)
+        return self.get_aggregate(context, aggregate_id)
 
     def remove_host_from_aggregate(self, context, aggregate_id, host):
         """Removes host from the aggregate."""
         # validates the host; ComputeHostNotFound is raised if invalid
         service = self.db.service_get_all_compute_by_host(context, host)[0]
-        aggregate = self.db.aggregate_get(context, aggregate_id)
-        if aggregate.operational_state in [aggregate_states.ACTIVE,
-                                           aggregate_states.ERROR]:
-            self.db.aggregate_host_delete(context, aggregate_id, host)
-            self.compute_rpcapi.remove_aggregate_host(context,
-                    aggregate_id=aggregate_id, host_param=host, host=host)
-            return self.get_aggregate(context, aggregate_id)
-        else:
-            invalid = {aggregate_states.CREATED: 'no hosts to remove',
-                       aggregate_states.CHANGING: 'setup in progress',
-                       aggregate_states.DISMISSED: 'aggregate deleted', }
-            if aggregate.operational_state in invalid.keys():
-                raise exception.InvalidAggregateAction(
-                        action='remove host',
-                        aggregate_id=aggregate_id,
-                        reason=invalid[aggregate.operational_state])
+        self.db.aggregate_host_delete(context, aggregate_id, host)
+        self.compute_rpcapi.remove_aggregate_host(context,
+                aggregate_id=aggregate_id, host_param=host, host=host)
+        return self.get_aggregate(context, aggregate_id)
 
     def _get_aggregate_info(self, context, aggregate):
         """Builds a dictionary with aggregate props, metadata and hosts."""

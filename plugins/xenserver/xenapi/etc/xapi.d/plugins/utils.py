@@ -25,9 +25,22 @@ import tempfile
 CHUNK_SIZE = 8192
 
 
+def _link(src, dst):
+    logging.info("Hard-linking file '%s' -> '%s'" % (src, dst))
+    os.link(src, dst)
+
+
+def _rename(src, dst):
+    logging.info("Renaming file '%s' -> '%s'" % (src, dst))
+    os.rename(src, dst)
+
+
 def make_subprocess(cmdline, stdout=False, stderr=False, stdin=False):
     """Make a subprocess according to the given command-line string
     """
+    # NOTE(dprince): shlex python 2.4 doesn't like unicode so we
+    # explicitly convert to ascii
+    cmdline = cmdline.encode('ascii')
     logging.info("Running cmd '%s'" % cmdline)
     kwargs = {}
     kwargs['stdout'] = stdout and subprocess.PIPE or None
@@ -120,7 +133,7 @@ def _handle_old_style_images(staging_path):
     for filename in ('snap.vhd', 'image.vhd', 'base.vhd'):
         path = os.path.join(staging_path, filename)
         if os.path.exists(path):
-            os.rename(path, os.path.join(staging_path, "%d.vhd" % file_num))
+            _rename(path, os.path.join(staging_path, "%d.vhd" % file_num))
             file_num += 1
 
 
@@ -143,6 +156,28 @@ def _assert_vhd_not_hidden(path):
                     locals())
 
 
+def _validate_footer_timestamp(vdi_path):
+    """
+    This check ensures that the timestamps listed in the VHD footer aren't in
+    the future.  This can occur during a migration if the clocks on the the two
+    Dom0's are out-of-sync. This would corrupt the SR if it were imported, so
+    generate an exception to bail.
+    """
+    check_cmd = "vhd-util check -n %(vdi_path)s -p" % locals()
+    check_proc = make_subprocess(check_cmd, stdout=True, stderr=True)
+    out, err = finish_subprocess(
+            check_proc, check_cmd, ok_exit_codes=[0, 22])
+    first_line = out.splitlines()[0].strip()
+
+    if 'primary footer invalid' in first_line:
+        raise Exception("VDI '%(vdi_path)s' has timestamp in the future,"
+                        " ensure source and destination host machines have"
+                        " time set correctly" % locals())
+    elif check_proc.returncode != 0:
+        raise Exception("Unexpected output '%(out)s' from vhd-util" %
+                        locals())
+
+
 def _validate_vdi_chain(vdi_path):
     """
     This check ensures that the parent pointers on the VHDs are valid
@@ -156,6 +191,7 @@ def _validate_vdi_chain(vdi_path):
         out, err = finish_subprocess(
                 query_proc, query_cmd, ok_exit_codes=[0, 22])
         first_line = out.splitlines()[0].strip()
+
         if first_line.endswith(".vhd"):
             return first_line
         elif 'has no parent' in first_line:
@@ -169,7 +205,29 @@ def _validate_vdi_chain(vdi_path):
 
     cur_path = vdi_path
     while cur_path:
+        _validate_footer_timestamp(cur_path)
         cur_path = get_parent_path(cur_path)
+
+
+def _validate_sequenced_vhds(staging_path):
+    """This check ensures that the VHDs in the staging area are sequenced
+    properly from 0 to n-1 with no gaps.
+    """
+    seq_num = 0
+    filenames = os.listdir(staging_path)
+    for filename in filenames:
+        if not filename.endswith('.vhd'):
+            continue
+
+        if filename == "swap.vhd":
+            continue
+
+        vhd_path = os.path.join(staging_path, "%d.vhd" % seq_num)
+        if not os.path.exists(vhd_path):
+            raise Exception("Corrupt image. Expected seq number: %d. Files: %s"
+                            % (seq_num, filenames))
+
+        seq_num += 1
 
 
 def import_vhds(sr_path, staging_path, uuid_stack):
@@ -186,6 +244,7 @@ def import_vhds(sr_path, staging_path, uuid_stack):
          'swap': {'uuid': 'ffff-bbbb'}}
     """
     _handle_old_style_images(staging_path)
+    _validate_sequenced_vhds(staging_path)
 
     imported_vhds = {}
     files_to_move = []
@@ -200,7 +259,7 @@ def import_vhds(sr_path, staging_path, uuid_stack):
         # Rename (0, 1 .. N).vhd -> aaaa-bbbb-cccc-dddd.vhd
         vhd_uuid = uuid_stack.pop()
         vhd_path = os.path.join(staging_path, "%s.vhd" % vhd_uuid)
-        os.rename(orig_vhd_path, vhd_path)
+        _rename(orig_vhd_path, vhd_path)
 
         if seq_num == 0:
             leaf_vhd_path = vhd_path
@@ -233,7 +292,7 @@ def import_vhds(sr_path, staging_path, uuid_stack):
         # Rename swap.vhd -> aaaa-bbbb-cccc-dddd.vhd
         vhd_uuid = uuid_stack.pop()
         swap_path = os.path.join(staging_path, "%s.vhd" % vhd_uuid)
-        os.rename(orig_swap_path, swap_path)
+        _rename(orig_swap_path, swap_path)
 
         _assert_vhd_not_hidden(swap_path)
 
@@ -243,18 +302,17 @@ def import_vhds(sr_path, staging_path, uuid_stack):
     # Move files into SR
     for orig_path in files_to_move:
         new_path = os.path.join(sr_path, os.path.basename(orig_path))
-        os.rename(orig_path, new_path)
+        _rename(orig_path, new_path)
 
     return imported_vhds
 
 
-def prepare_staging_area_for_upload(sr_path, staging_path, vdi_uuids):
+def prepare_staging_area(sr_path, staging_path, vdi_uuids, seq_num=0):
     """Hard-link VHDs into staging area."""
-    seq_num = 0
     for vdi_uuid in vdi_uuids:
         source = os.path.join(sr_path, "%s.vhd" % vdi_uuid)
         link_name = os.path.join(staging_path, "%d.vhd" % seq_num)
-        os.link(source, link_name)
+        _link(source, link_name)
         seq_num += 1
 
 
