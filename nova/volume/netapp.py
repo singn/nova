@@ -995,3 +995,49 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
+
+
+class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
+    """NetApp C-mode iSCSI volume driver."""
+
+    def __init__(self, *args, **kwargs):
+        super(NetAppCmodeISCSIDriver, self).__init__(*args, **kwargs)
+
+    def do_setup(self, context):
+        pass
+
+    def check_for_setup_error(self):
+        pass
+
+    def create_volume(self, volume):
+        pass
+
+    def delete_volume(self, volume):
+        pass
+
+    def ensure_export(self, context, volume):
+        pass
+
+    def create_export(self, context, volume):
+        pass
+
+    def remove_export(self, context, volume):
+        pass
+
+    def initialize_connection(self, volume, connector):
+        pass
+
+    def terminate_connection(self, volume, connector):
+        pass
+
+    def create_snapshot(self, snapshot):
+        pass
+
+    def delete_snapshot(self, snapshot):
+        pass
+
+    def create_volume_from_snapshot(self, volume, snapshot):
+        pass
+
+    def check_for_export(self, context, volume_id):
+        raise NotImplementedError()
