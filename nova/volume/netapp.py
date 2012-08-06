@@ -1000,20 +1000,52 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
     """NetApp C-mode iSCSI volume driver."""
 
+    EXEC_WAIT_INTERVAL_SEC =  2
+    WORKFLOW_CREATE_CM_LUN        = "Create CM Lun"
+    WORKFLOW_MAP_CM_LUN           = "Map CM Lun"
+    WORKFLOW_UNMAP_CM_LUN         = "Unmap CM Lun"
+    WORKFLOW_REMOVE_CM_LUN        = "Remove CM Lun"
+    WORKFLOW_CLONE_CM_LUN         = "Clone CM Lun"
+    WORKFLOW_GET_LUN_TARGET_MAP   = "Get lun maping and  iSCSI target details for c-mode cluster,vserver,lun"
+    WORKFLOW_READ_LUN_TARGET_MAP  = "Read and clean lun map and CM iscsi target details"
+    
     def __init__(self, *args, **kwargs):
         super(NetAppCmodeISCSIDriver, self).__init__(*args, **kwargs)
-
-    def do_setup(self, context):
-        pass
-
+        self.luns = []
+        self.lun_table = {}
+        
+    def setUp(self, **kwargs):
+        self._create_client(**kwargs)
+        self._initialise_workflows()
+        
     def check_for_setup_error(self):
         pass
 
     def create_volume(self, volume):
-        pass
-
+        """ Driver entry point for creating a new volume.
+        
+            Parameters expected are name, size in mb and os type.
+        """
+        default_os_type = 'linux'
+        default_size = '100'  # 100 MB
+        megabytes = 1048576L  
+        name = volume['name']
+        size = volume['size']
+        if size:
+            size = int(size)/megabytes
+        else:
+            size = default_size 
+        if hasattr(volume, 'os_type'):
+            os_type = volume['os_type']
+        else:
+            os_type = default_os_type
+        self._create_lun(name, os_type, size)   
+        
     def delete_volume(self, volume):
-        pass
+        """ Driver entry point for removing a volume """
+        name = volume['name']
+        location = volume['location']
+        self._remove_lun(name, location)
 
     def ensure_export(self, context, volume):
         pass
@@ -1031,13 +1063,273 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         pass
 
     def create_snapshot(self, snapshot):
-        pass
+        """Driver entry point for creating a snapshot.
+
+        This driver implements snapshots by using efficient single-file
+        (LUN) cloning.
+        """
+        vol_name = snapshot['volume_name']
+        snapshot_name = snapshot['name']
+        location = snapshot['location']
+        lun = self._lookup_lun_for_volume(vol_name, location)
+        lun_path = str(lun.path)
+        lun_name = lun_path[lun_path.rfind('/') + 1:]
+        lun_vol_name = self._extract_cm_volume_from_path(lun_path)
+        rel_dest_path = snapshot_name
+        cluster_name = location.cluster
+        vserver_name = location.vserver
+        self._clone_lun(cluster_name, vserver_name, lun_vol_name, lun_name, rel_dest_path)
 
     def delete_snapshot(self, snapshot):
-        pass
-
+        """Driver entry point for deleting a snapshot."""
+        vol_name = snapshot['volume_name']
+        snapshot_name = snapshot['name']
+        location = snapshot['location']
+        lun = self._lookup_lun_for_volume(vol_name, location)
+        lun_path = lun.path
+        lun_vol_name = self._extract_cm_volume_from_path(lun_path)
+        self._destroy_lun(snapshot_name, lun_vol_name, location)
+        
     def create_volume_from_snapshot(self, volume, snapshot):
-        pass
+        """Driver entry point for creating a new volume from a snapshot.
+
+        Many would call this "cloning" and in fact we use cloning to implement
+        this feature.
+        """
+        vol_size = volume['size']
+        snap_size = snapshot['volume_size']
+        if vol_size != snap_size:
+            msg = _('Cannot create volume of size %(vol_size)s from '
+                'snapshot of size %(snap_size)s')
+            raise Exception(msg % locals())
+        vol_name = snapshot['volume_name']
+        snapshot_name = snapshot['name']
+        location = snapshot['location']
+        lun = self._lookup_lun_for_volume(vol_name, location)
+        lun_path = lun.path
+        location = lun.location
+        cluster_name = location.cluster
+        vserver_name = location.vserver
+        lun_vol_name = self._extract_cm_volume_from_path(lun_path)
+        clone_name = volume['name']
+        self._clone_lun(cluster_name, vserver_name, lun_vol_name, snapshot_name, clone_name)
+        
 
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
+        
+    def _create_client(self, **kwargs):
+        """ Create client """
+        wsdl_url = kwargs['wsdl_url']
+        if kwargs['cache']:
+            self.client = client.Client(wsdl_url,username=kwargs['login'],password=kwargs['password'])
+        else:
+            self.client = client.Client(wsdl_url,username=kwargs['login'],password=kwargs['password'],cache=None)
+            
+    def _initialise_workflows(self):
+        """ Map workflow names to the respective ids
+        
+            The method is used to populate dict with workflow names
+            and ids to be used at a later point in the call. Also used
+            as method verifying connectivity error.
+        """
+        workflow_list = self._get_all_workflows()
+        self.workflows = dict([(x['name'],x['id']) for x in workflow_list])
+        
+    def _get_all_workflows(self):
+        """ Get all available workflows """
+        
+        server = self.client.service
+        try:
+            workflow_list = server.getAllWorkflows()
+            return workflow_list
+        except:
+            raise 
+            
+    def _convert_res_to_dict(self, param_list):
+        """ Convert list params to dictionary for easy access """
+        
+        dictionary = {}
+        for item in param_list:
+            dictionary[item.name] = item.value
+        return dictionary
+      
+    def _create_input_param_list(self,**inputkwargs):
+        
+        """ Helper method to form input param list
+            in the expected format.
+        """
+        input_param_list = [ x + "=" + inputkwargs[x] for x in inputkwargs.keys() ]
+        return input_param_list
+    
+    def _get_workflow_run_response(self,job_id):
+        """ Get the job response for a workflow
+            with given id. Wait till the job completes
+            or timeout.
+        """
+        
+        server = self.client.service
+        try:
+            response = server.getJobStatus(job_id)
+            while(response['jobStatus'] == "RUNNING" or (response['jobStatus'] == "SCHEDULED" and response['scheduleType'] == "Immediate") or (response['jobStatus'] == "PENDING" and response['scheduleType'] == "Immediate")):
+                time.sleep(self.EXEC_WAIT_INTERVAL_SEC)
+                response = server.getJobStatus(job_id)
+            return response
+        except suds.WebFault:
+            raise
+        
+    def _get_workflow_return_parameters(self,job_id):
+        """ Get return parameter reference for the job id"""
+        
+        response = self._get_workflow_run_response(job_id)
+        if response['jobStatus'] == "COMPLETED":
+            if response.__contains__('returnParameter'):
+                return_param_map = response['returnParameter']
+                return return_param_map
+        elif response['jobStatus'] == "FAILED":
+            raise exception.NovaException(response['errorMessage'])
+        else:
+            raise exception.NovaException("Job did not complete successfully. Status: " + response['jobStatus'])
+        
+    def _execute_workflow(self,workflow_name,**input_params):
+        """ Execute workflow identified by name.
+        
+            Execute the workflow by resolving workflow_id.
+            Create input param list in required format.
+            Return result parmeters.
+        """
+        
+        server = self.client.service
+        workflow_id = self.workflows[workflow_name]
+        input_param_list = self._create_input_param_list(**input_params)
+        try:
+            job_id = server.executeWorkflow(workflow_id,input_param_list)
+            return_params = self._get_workflow_return_parameters(job_id)
+            return return_params
+        except (suds.WebFault, Exception):
+            raise 
+        
+    def _lookup_lun_for_volume(self, name, location):
+        """ lookup lun for given name and location """
+        
+        if self.lun_table.has_key(name):
+            return self.lun_table[name]
+        suffix = '/' + name
+        for lun in self.luns:
+            if lun.path.endswith(suffix):
+                if lun.location['cluster'] == location['cluster'] and lun.location['vserver'] == location['vserver']:
+                    return lun
+                else:
+                    continue
+        msg = _("No entry for lun in volume %s")
+        raise exception.NovaException(msg %name)
+      
+    def _create_lun(self, lun_name, lun_os_type, lun_size_mb):
+        """ Create c mode lun """
+        
+        input_param_list = {"name":lun_name,"os_type":lun_os_type,"size_mb":lun_size_mb}
+        result = self._convert_res_to_dict(self._execute_workflow(self.WORKFLOW_CREATE_CM_LUN,**input_param_list))
+        location = CmLocation(result['cluster'],result['vserver'])
+        path = result['lun_path']                            
+        lun = CmLun(location, path)
+        self.luns.append(lun)
+        self.lun_table[lun_name] = lun
+                    
+    def _clone_lun(self,cluster_name,vserver_name,volume_name,lun_name,rel_destination_path="",snapshot_name="",space_reserved="N"):
+        """ Clone a given cm lun """
+        
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"volume_name":volume_name,"lun_name":lun_name,"space_reserved":space_reserved}
+        if rel_destination_path:
+            param_map['rel_destination_path'] = rel_destination_path
+        if snapshot_name:
+            param_map['snapshot_name'] = snapshot_name
+        self._execute_workflow(self.WORKFLOW_CLONE_CM_LUN,**param_map)
+        
+    def _remove_destroy_lun(self, name, location):
+        """ Remove a given cm lun from filer and also from data structures"""
+        
+        lun = self._lookup_lun_for_volume(name, location)
+        volume_name = self._extract_cm_volume_from_path(lun.path)
+        self._destroy_lun(name, volume_name, location)
+        self.lun_table.pop(name)
+        self.luns.remove(lun) 
+    
+    def _destroy_lun(self, name, volume_name, location):
+        """ Remove a given cm lun from filer """
+        
+        cluster_name = location.cluster
+        vserver_name = location.vserver
+        force = "Y"
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"volume_name":volume_name,"lun_name":name,"force":force}
+        self._execute_workflow(self.WORKFLOW_REMOVE_CM_LUN,**param_map)       
+        
+    def _unmap_lun(self,cluster_name,vserver_name,volume_name,lun_name,igroup_name):
+        """ Unmap a cm lun from initiator group """
+        
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"volume_name":volume_name,"lun_name":lun_name,"igroup_name":igroup_name}
+        self._execute_workflow(self.WORKFLOW_UNMAP_CM_LUN,**param_map)
+        
+        
+    def _map_lun(self,cluster_name,vserver_name,volume_name,lun_name,igroup_name,lun_id="",igroup_os_type="iscsi",igroup_portset="",igroup_protocol="iscsi",initiators=""):
+        """ Map a cm lun to initiator
+        
+            Map lun to given initiator. Create initiator
+            if its not already present.
+        """
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"vol_name":volume_name,"lun_name":lun_name,"igroup_name":igroup_name}
+        if lun_id:
+            param_map['lun_id'] = lun_id
+        if igroup_os_type:
+            param_map['igroup_os_type'] = igroup_os_type
+        if igroup_portset:
+            param_map['igroup_portset'] = igroup_portset
+        if igroup_os_type:
+            param_map['igroup_protocol'] = igroup_protocol
+        if initiators:
+            param_map['initiators'] = initiators
+        self._execute_workflow(self.WORKFLOW_MAP_CM_LUN,**param_map)
+        
+    def _extract_cm_volume_from_path(self, path):
+        """ Extracts volume name from a given path """
+          
+        path_elements = path.split('/')
+        if path_elements[1] == 'vol' and len(path_elements) >= 4:
+            return path_elements[2]
+        elif len(path_elements) >= 3:
+            return path_elements[1] # 'vol' not present as prefix   
+        msg =_("CM volume not found in path %s")
+        raise exception.NovaException(msg %path)  
+    
+    def _get_lun_iscsi_target_map(self, cluster_name, vserver_name, volume_name, lun_name):
+        """ Gets the lun mapping and iscsi target details in WFA """
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"volume_name":volume_name,"lun_name":lun_name}
+        self._execute_workflow(self.WORKFLOW_GET_LUN_TARGET_MAP,**param_map)  
+        
+    def _read_lun_iscsi_target_map(self, cluster_name, vserver_name, volume_name, lun_name):
+        """ Reads the lun mapping and terget details from WFA """
+        param_map = {"cluster_name":cluster_name,"vserver_name":vserver_name,"volume_name":volume_name,"lun_name":lun_name}
+        return_param = self._execute_workflow(self.WORKFLOW_READ_LUN_TARGET_MAP,**param_map)    
+
+
+
+class CmLocation(object):
+    """ Represents a location in c mode storage system
+    
+        Any location in c mode system is a unique combination
+        of cluster and vserver.
+    """
+    
+    def __init__(self, cluster, vserver):
+        """ cluster is cluster name.
+            vserver is vserver name
+        """
+        
+        self.cluster = cluster
+        self.vserver = vserver
+
+class CmLun(object):
+    """ Represents a c mode lun """
+    
+    def __init__(self, location, lun_path):
+        self.location = location
+        self.path = lun_path
