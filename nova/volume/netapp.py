@@ -1,4 +1,5 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
+from setuptools.tests.test_resources import Metadata
 
 # Copyright (c) 2012 NetApp, Inc.
 # Copyright (c) 2012 OpenStack LLC.
@@ -27,7 +28,7 @@ import string
 import time
 
 import suds
-from suds import client
+from suds import client, WebFault
 from suds.sax import text
 
 from nova import exception
@@ -996,48 +997,414 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
 
-
+class NetAppLun(object):
+    """Represents a lun on netapp storage"""
+    def __init__(self, handle, name, size, metadata_list):
+        self.handle = handle
+        self.name = name
+        self.size = size
+        self.metadata = metadata_list
+        
+    def get_type(self):
+        """Get the os type of lun"""
+        for meta in self.metadata:
+            if meta.key == 'os_type':
+                return meta.value
+        LOG.debug("No os type defined for the lun %s" %(self.name))
+        
 class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
     """NetApp C-mode iSCSI volume driver."""
 
     def __init__(self, *args, **kwargs):
         super(NetAppCmodeISCSIDriver, self).__init__(*args, **kwargs)
+        self.discovered_luns = []
+        self.lun_table = {}
 
     def do_setup(self, context):
-        pass
+        """Setup the NetApp Volume driver.
 
+        Called one time by the manager after the driver is loaded.
+        Validate the flags we care about and setup the suds (web services)
+        client.
+        """
+        self._check_flags()
+        self._create_client(wsdl_url=FLAGS.netapp_wsdl_url,
+            login=FLAGS.netapp_login, password=FLAGS.netapp_password,
+            hostname=FLAGS.netapp_server_hostname,
+            port=FLAGS.netapp_server_port, cache=True)
+        
     def check_for_setup_error(self):
-        pass
+        """Check that the driver is working and can communicate.
 
+        Invoke a web services API to make sure we can talk to the server.
+        Also perform the discovery of LUNs.
+        """
+        self._discover_luns()
+        LOG.debug(_("Connected to NetApp server"))
+        
     def create_volume(self, volume):
-        pass
-
+        """Driver entry point for creating a new volume."""
+        default_os_type = 'linux'
+        default_size = '104857600'  # 100 MB
+        gigabytes = 1073741824L  # 2^30
+        name = volume['name']
+        if int(volume['size']) == 0:
+            size = default_size
+        else:
+            size = str(int(volume['size']) * gigabytes)
+        extra_args = {'os_type':default_os_type}
+        self._provision_lun(name, size, **extra_args)
+        
     def delete_volume(self, volume):
-        pass
-
+        """Driver entry point for destroying existing volumes."""
+        name = volume['name']
+        self._remove_destroy_lun(name)
+      
     def ensure_export(self, context, volume):
-        pass
+        """Driver entry point to get the export info for an existing volume."""
+        return self._get_export(volume)
 
     def create_export(self, context, volume):
-        pass
+        """Driver entry point to get the export info for a new volume."""
+        return self._get_export(volume)
 
     def remove_export(self, context, volume):
+        """Driver exntry point to remove an export for a volume.
+
+        Since exporting is idempotent in this driver, we have nothing
+        to do for unexporting.
+        """
         pass
 
     def initialize_connection(self, volume, connector):
-        pass
+        """Driver entry point to attach a volume to an instance.
 
+        Do the LUN masking on the storage system so the initiator can access
+        the LUN on the target. Also return the iSCSI properties so the
+        initiator can find the LUN. This implementation does not call
+        _get_iscsi_properties() to get the properties because cannot store the
+        LUN number in the database. We only find out what the LUN number will
+        be during this method call so we construct the properties dictionary
+        ourselves.
+        """
+        initiator_name = connector['initiator']
+        default_initiator_type = "iscsi" 
+        lun_handle = volume['provider_location']
+        if not lun_handle:
+            msg = _("No LUN ID for volume %s")
+            raise exception.NovaException(msg % volume['name'])
+        lun = self._get_lun_details(lun_handle)
+        if not lun:
+            raise exception.NovaException("No lun exists for the provider_location %s" %lun_handle)
+        target_map_details = self._ensure_initiator_mapped(lun.name, initiator_name, default_initiator_type)
+        if not target_map_details.address and target_map_details.port:
+            msg = _('Failed to get target portal for provider location %s host')
+            raise exception.NovaException(msg % lun_handle)
+
+        iqn = target_map_details.iqn
+        if not iqn:
+            msg = _('Failed to get target IQN for provider location %s  host')
+            raise exception.NovaException(msg % lun_handle)
+
+        properties = {}
+        properties['target_discovered'] = False
+        (address, port) = (target_map_details.address, target_map_details.port)
+        properties['target_portal'] = '%s:%s' % (address, port)
+        properties['target_iqn'] = iqn
+        properties['target_lun'] = target_map_details.lunNumber
+        properties['volume_id'] = volume['id']
+
+        auth = volume['provider_auth']
+        if auth:
+            (auth_method, auth_username, auth_secret) = auth.split()
+
+            properties['auth_method'] = auth_method
+            properties['auth_username'] = auth_username
+            properties['auth_password'] = auth_secret
+
+        return {
+            'driver_volume_type': 'iscsi',
+            'data': properties,
+        }
+        
     def terminate_connection(self, volume, connector):
-        pass
+        """Driver entry point to unattach a volume from an instance.
 
+        Unmask the LUN on the storage system so the given intiator can no
+        longer access it.
+        """
+        initiator_name = connector['initiator']
+        default_initiator_type = "iscsi"
+        lun_handle = volume['provider_location']
+        if not lun_handle:
+            msg = _('No LUN ID for volume %s')
+            raise exception.NovaException(msg % (volume['name']))
+        lun = self._get_lun_details(lun_handle)
+        self._unmap_lun(lun.name, initiator_name, default_initiator_type)
+    
     def create_snapshot(self, snapshot):
-        pass
+        """Driver entry point for creating a snapshot.
+
+        This driver implements snapshots by using efficient single-file
+        (LUN) cloning.
+        """
+        vol_name = snapshot['volume_name']
+        snapshot_name = snapshot['name']
+        lun = self._lookup_lun_for_volume(vol_name)
+        lun_name = lun.name
+        extra_args = {'space_reserved':False}
+        self._clone_lun(lun_name, snapshot_name, **extra_args)
 
     def delete_snapshot(self, snapshot):
-        pass
-
+        """Driver entry point for deleting a snapshot."""
+        snapshot_name = snapshot['name']
+        self._destroy_lun(snapshot_name)
+        
     def create_volume_from_snapshot(self, volume, snapshot):
-        pass
+        """Driver entry point for creating a new volume from a snapshot.
 
+        Many would call this "cloning" and in fact we use cloning to implement
+        this feature.
+        """
+        vol_size = volume['size']
+        snap_size = snapshot['volume_size']
+        if vol_size != snap_size:
+            msg = _('Cannot create volume of size %(vol_size)s from '
+                'snapshot of size %(snap_size)s')
+            raise exception.NovaException(msg % locals())
+        vol_name = snapshot['volume_name']
+        snapshot_name = snapshot['name']
+        lun = self._lookup_lun_for_volume(vol_name)
+        old_type = lun.get_type()
+        new_type = self._get_ss_type(volume)
+        if new_type != old_type:
+            msg = _('Cannot create volume of type %(new_type)s from '
+                'snapshot of type %(old_type)s')
+            raise exception.NovaException(msg % locals())
+        clone_name = volume['name']
+        extra_args = {'space_reserved':True}
+        clone = self._clone_lun(snapshot_name, clone_name, **extra_args)
+        self._add_lun_to_table(clone)
+        
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
+    
+    def _create_client(self, **kwargs):
+        """Instantiate a web services client.
+
+        This method creates a "suds" client to make web services calls to the
+        DFM server. Note that the WSDL file is quite large and may take
+        a few seconds to parse.
+        """
+        wsdl_url = kwargs['wsdl_url']
+        LOG.debug(_('Using WSDL: %s') % wsdl_url)
+        if kwargs['cache']:
+            self.client = client.Client(wsdl_url, username=kwargs['login'],
+                                        password=kwargs['password'])
+        else:
+            self.client = client.Client(wsdl_url, username=kwargs['login'],
+                                        password=kwargs['password'],
+                                        cache=None)
+                
+    def _check_flags(self):
+        """Ensure that the flags we care about are set."""
+        required_flags = ['netapp_wsdl_url', 'netapp_login', 'netapp_password',
+                'netapp_server_hostname', 'netapp_server_port']
+        for flag in required_flags:
+            if not getattr(FLAGS, flag, None):
+                raise exception.NovaException(_('%s is not set') % flag)
+            
+    def _get_ss_type(self, volume):
+        """Get the storage service type for a volume."""
+        type_id = volume['volume_type_id']
+        if not type_id:
+            return None
+        volume_type = volume_types.get_volume_type(None, type_id)
+        if not volume_type:
+            return None
+        return volume_type['name']
+    
+    def _provision_lun(self, name, size, **kwargs):
+        """Provision lun on netapp storage"""
+        server = self.client.service
+        try:
+            metadata_array = self._create_metadata_list(**kwargs) 
+            lun = server.provisionLun(name, size, metadata_array)
+            LOG.debug("Created lun with name %s" %name)
+            self._add_lun_to_table(lun)
+        except (WebFault, Exception):
+            msg = _("Failed to create lun with name %s")
+            raise exception.NovaException(msg %(name))
+        
+    def _add_lun_to_table(self, lun):
+        """Adds lun instance to list"""
+        self.lun_table[lun.name] = lun
+        self.discovered_luns.append(lun)
+        
+    def _remove_lun_from_table(self, name):
+        """Removes from the driver datastructures"""
+        lun = self._lookup_lun_for_volume(name)
+        if self.lun_table.has_key(name):
+            self.lun_table.pop(name)
+        else:
+            LOG.debug(_("Cannot remove entry for %s from lun table. It does not exist.") %(name))
+        for lun in self.discovered_luns:
+            if lun.name == name:
+                self.discovered_luns.remove(lun)
+            else:
+                LOG.debug(_("Cannot remove entry for %s from discovered luns list. It does not exist.") %(name))
+                
+    def _clone_lun(self, name, clone_name, **kwargs):
+        """Clone lun with handle as given"""
+        server = self.client.service
+        lun = self._lookup_lun_for_volume(name)
+        handle = lun.handle
+        metadata = self._create_metadata_list(**kwargs)
+        try:
+            clone = server.cloneLun(handle, clone_name, metadata)  
+            LOG.debug(_("Clonned lun with name %s") %(name))
+            return clone
+        except (WebFault,Exception):
+            msg = _("Failed cloning for lun %s")
+            raise exception.NovaException(msg %(name))
+            
+            
+    def _create_metadata_list(self, **kwargs):
+        """Creates metadataArray from kwargs"""
+        metadata_list = []
+        for key in kwargs.keys(): 
+            metadata = self.client.factory.create("metadata")
+            metadata.key = key
+            metadata.value = kwargs[key]
+            metadata_list.append(metadata)
+        return metadata_list 
+    
+    def _map_lun(self, name, initiator_name, initiator_type="iscsi"):
+        """Map lun to to initiator on NetApp storage"""
+        server = self.client.service
+        lun = self._lookup_lun_for_volume(name)
+        handle = lun.handle
+        try:
+            server.mapLun(handle, initiator_type, initiator_name)
+            LOG.debug(_("Mapped lun %s to the initiator %s") %(name, initiator_name))   
+        except:
+            msg = _("Failure mapping lun %s to the initiator %s")
+            raise exception.NovaException(msg %(name, initiator_name))
+        
+    def _unmap_lun(self, name, initiator_name, initiator_type="iscsi"):
+        """Unmap a lun from a initiator"""
+        server = self.client.service
+        lun = self._lookup_lun_for_volume(name)
+        handle = lun.handle
+        try:
+            server.unmapLun(handle, initiator_type, initiator_name)
+            LOG.debug(_("Unmapped lun %s from the initiator %s") %(name, initiator_name))   
+        except:
+            msg = _("Failure unmapping lun %s from the initiator %s")
+            raise exception.NovaException(msg %(name, initiator_name))                   
+        
+    def _get_lun_target_details(self, name, initiator_name, initiator_type="iscsi"):
+        """Get the lun mapping and target details for the lun and target type"""
+        server = self.client.service
+        lun = self._lookup_lun_for_volume(name)
+        handle = lun.handle
+        try:
+            target_map_list = server.getLunTargetDetails(handle, initiator_name, initiator_type) 
+            LOG.debug(_("Succesfully fetched target details for lun %s, initiator %s and target type %s") %(name, initiator_name, initiator_type))
+            return target_map_list
+        except:
+            msg = _("Failure fetching target details for lun %s, initiator name %s and target type %s")
+            raise exception.NovaException(msg %(name, initiator_name, initiator_type))
+        
+    def _get_lun_details(self, handle):
+        """Get lun based on the handle"""
+        for lun in self.discovered_luns:
+            if lun.handle == handle:
+                return lun
+        LOG.debug("No lun found in discovered luns for handle %s" %(handle))
+        
+    def _remove_destroy_lun(self, name):
+        """Remove the LUN, also destroying it.
+
+        Remove the LUN from the NetApp server and destroy the actual LUN on the
+        storage system.
+        """
+        self._destroy_lun(name)
+        self._remove_lun_from_table(name)
+        
+    def _lookup_lun_for_volume(self, name):
+        """Lookup the LUN that corresponds to the given volume.
+
+        Initial lookups involve a table scan of all of the discovered LUNs,
+        but later lookups are done instantly from the hashtable.
+        """
+        if name in self.lun_table:
+            return self.lun_table[name]
+        for lun in self.discovered_luns:
+            if lun.name == name:
+                return lun
+        msg = _("No entry in LUN table for volume %s")
+        raise exception.NovaException(msg % (name))
+
+    def _discover_luns(self):
+        """Discover the LUNs from NetApp server.
+
+        Discover all of the OpenStack-created LUNs in the NetApp server.
+        """
+        self.discovered_luns = []
+        self.lun_table = {}
+        server = self.client.service
+        try:
+            luns = server.listLuns()
+            for lun in luns:
+                name = lun.name
+                handle = lun.handle
+                size = lun.size
+                metadata_array = lun.metadataArray
+                discovered_lun = NetAppLun(handle, name, size, metadata_array)
+                self._add_lun_to_table(discovered_lun)
+                LOG.debug("Success geting lun list from server")
+        except (WebFault, Exception):
+            msg = _("Failure discovering luns on NetApp server")
+            raise exception.NovaException(msg)
+            
+    def _destroy_lun(self, name):
+        """Destroy lun on NetApp storage"""
+        lun = self._lookup_lun_for_volume(name)
+        handle = lun.handle
+        server = self.client.service
+        try:
+            server.destroyLun(handle)
+            LOG.debug("Destroyed lun with name %s" %(name))
+        except (suds.WebFault, Exception):
+            msg = _('Failed to remove and delete lun with name %s')
+            raise exception.NovaException(msg %(name))
+        
+    def _ensure_initiator_mapped(self, name, initiator_name, initiator_type = "iscsi"):
+        """Ensure that a LUN is mapped to a particular initiator.
+
+        Check if a LUN is mapped to a given initiator already and create
+        the mapping if it is not. A new igroup will be created if needed.
+        Returns the LUN number for the mapping between the LUN and initiator
+        in both cases.
+        """
+        try:
+            self._map_lun(name, initiator_name, initiator_type)
+        except WebFault:
+            LOG.debug("Seems lun %s is already mapped to the initiator %s with type %s" %(name, initiator_name, initiator_type))
+        finally:
+            lun_target_details = self._get_lun_target_details(name, initiator_name, initiator_type)
+            return lun_target_details
+          
+    def _get_export(self, volume):
+        """Get the iSCSI export details for a volume.
+
+        Looks up the LUN in DFM based on the volume and project name, then get
+        the LUN's ID. We store that value in the database instead of the iSCSI
+        details because we will not have the true iSCSI details until masking
+        time (when initialize_connection() is called).
+        """
+        name = volume['name']
+        lun = self._lookup_lun_for_volume(name)
+        return {'provider_location': lun.handle}
+    
