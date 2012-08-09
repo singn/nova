@@ -999,17 +999,16 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
 
 class NetAppLun(object):
     """Represents a lun on netapp storage"""
-    def __init__(self, handle, name, size, metadata_list):
+    def __init__(self, handle, name, size, metadata_dict):
         self.handle = handle
         self.name = name
         self.size = size
-        self.metadata = metadata_list
+        self.metadata = metadata_dict
         
     def get_type(self):
         """Get the os type of lun"""
-        for meta in self.metadata:
-            if meta.key == 'os_type':
-                return meta.value
+        if self.metadata.has_key('os_type'):
+            return self.metadata['os_type']
         LOG.debug("No os type defined for the lun %s" %(self.name))
         
 class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
@@ -1137,7 +1136,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         default_initiator_type = "iscsi"
         lun_handle = volume['provider_location']
         if not lun_handle:
-            msg = _('No LUN ID for volume %s')
+            msg = ('No LUN ID for volume %s')
             raise exception.NovaException(msg % (volume['name']))
         lun = self._get_lun_details(lun_handle)
         self._unmap_lun(lun.name, initiator_name, default_initiator_type)
@@ -1184,7 +1183,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         clone_name = volume['name']
         extra_args = {'space_reserved':True}
         clone = self._clone_lun(snapshot_name, clone_name, **extra_args)
-        self._add_lun_to_table(clone)
+        self._add_lun_to_table(NetAppLun(clone.handle, clone.name, clone.size, self._create_dict_from_meta(clone.metadataArray)))
         
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
@@ -1231,13 +1230,15 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             metadata_array = self._create_metadata_list(**kwargs) 
             lun = server.provisionLun(name, size, metadata_array)
             LOG.debug("Created lun with name %s" %name)
-            self._add_lun_to_table(lun)
+            self._add_lun_to_table(NetAppLun(lun.handle, lun.name, lun.size, self._create_dict_from_meta(lun.metadataArray)))
         except (WebFault, Exception):
-            msg = _("Failed to create lun with name %s")
+            msg = ("Failed to create lun with name %s")
             raise exception.NovaException(msg %(name))
         
     def _add_lun_to_table(self, lun):
         """Adds lun instance to list"""
+        if(not isinstance(lun, NetAppLun)):
+            raise exception.NovaException("Lun not type of NetApp lun.")            
         self.lun_table[lun.name] = lun
         self.discovered_luns.append(lun)
         
@@ -1247,12 +1248,12 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         if self.lun_table.has_key(name):
             self.lun_table.pop(name)
         else:
-            LOG.debug(_("Cannot remove entry for %s from lun table. It does not exist.") %(name))
+            LOG.debug(("Cannot remove entry for %s from lun table. It does not exist.") %(name))
         for lun in self.discovered_luns:
             if lun.name == name:
                 self.discovered_luns.remove(lun)
             else:
-                LOG.debug(_("Cannot remove entry for %s from discovered luns list. It does not exist.") %(name))
+                LOG.debug(("Cannot remove entry for %s from discovered luns list. It does not exist.") %(name))
                 
     def _clone_lun(self, name, clone_name, **kwargs):
         """Clone lun with handle as given"""
@@ -1265,19 +1266,19 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             LOG.debug(_("Clonned lun with name %s") %(name))
             return clone
         except (WebFault,Exception):
-            msg = _("Failed cloning for lun %s")
+            msg = ("Failed cloning for lun %s")
             raise exception.NovaException(msg %(name))
             
             
     def _create_metadata_list(self, **kwargs):
         """Creates metadataArray from kwargs"""
-        metadata_list = []
+        metadataArray = self.client.factory.create("metadataArray")
         for key in kwargs.keys(): 
-            metadata = self.client.factory.create("metadata")
-            metadata.key = key
-            metadata.value = kwargs[key]
-            metadata_list.append(metadata)
-        return metadata_list 
+            meta = self.client.factory.create("metadata")
+            meta.key = key
+            meta.value = kwargs[key]
+            metadataArray.metadata.append(meta)
+        return metadataArray  
     
     def _map_lun(self, name, initiator_name, initiator_type="iscsi"):
         """Map lun to to initiator on NetApp storage"""
@@ -1288,7 +1289,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             server.mapLun(handle, initiator_type, initiator_name)
             LOG.debug(_("Mapped lun %s to the initiator %s") %(name, initiator_name))   
         except:
-            msg = _("Failure mapping lun %s to the initiator %s")
+            msg = ("Failure mapping lun %s to the initiator %s")
             raise exception.NovaException(msg %(name, initiator_name))
         
     def _unmap_lun(self, name, initiator_name, initiator_type="iscsi"):
@@ -1300,7 +1301,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             server.unmapLun(handle, initiator_type, initiator_name)
             LOG.debug(_("Unmapped lun %s from the initiator %s") %(name, initiator_name))   
         except:
-            msg = _("Failure unmapping lun %s from the initiator %s")
+            msg = ("Failure unmapping lun %s from the initiator %s")
             raise exception.NovaException(msg %(name, initiator_name))                   
         
     def _get_lun_target_details(self, name, initiator_name, initiator_type="iscsi"):
@@ -1313,7 +1314,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             LOG.debug(_("Succesfully fetched target details for lun %s, initiator %s and target type %s") %(name, initiator_name, initiator_type))
             return target_map_list
         except:
-            msg = _("Failure fetching target details for lun %s, initiator name %s and target type %s")
+            msg = ("Failure fetching target details for lun %s, initiator name %s and target type %s")
             raise exception.NovaException(msg %(name, initiator_name, initiator_type))
         
     def _get_lun_details(self, handle):
@@ -1343,7 +1344,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         for lun in self.discovered_luns:
             if lun.name == name:
                 return lun
-        msg = _("No entry in LUN table for volume %s")
+        msg = ("No entry in LUN table for volume %s")
         raise exception.NovaException(msg % (name))
 
     def _discover_luns(self):
@@ -1365,7 +1366,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
                 self._add_lun_to_table(discovered_lun)
                 LOG.debug("Success geting lun list from server")
         except (WebFault, Exception):
-            msg = _("Failure discovering luns on NetApp server")
+            msg = ("Failure discovering luns on NetApp server")
             raise exception.NovaException(msg)
             
     def _destroy_lun(self, name):
@@ -1377,7 +1378,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             server.destroyLun(handle)
             LOG.debug("Destroyed lun with name %s" %(name))
         except (suds.WebFault, Exception):
-            msg = _('Failed to remove and delete lun with name %s')
+            msg = ('Failed to remove and delete lun with name %s')
             raise exception.NovaException(msg %(name))
         
     def _ensure_initiator_mapped(self, name, initiator_name, initiator_type = "iscsi"):
@@ -1408,3 +1409,9 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         lun = self._lookup_lun_for_volume(name)
         return {'provider_location': lun.handle}
     
+    def _create_dict_from_meta(self, metadata_array):
+        """Creates dictionary from metadata array"""
+        meta_dict = {}
+        for meta in metadata_array.metadata:
+            meta_dict[meta.key] = meta.value
+        return meta_dict
