@@ -1005,20 +1005,20 @@ class NetAppLun(object):
         self.size = size
         self.metadata = metadata_dict
         
-    def get_type(self):
-        """Get the os type of lun"""
-        if self.metadata.has_key('os_type'):
-            return self.metadata['os_type']
-        LOG.debug("No os type defined for the lun %s" %(self.name))
+    def get_metadata_property(self, prop):
+        """Get the metadata property of lun"""
+        if self.metadata.has_key(prop):
+            return self.metadata[prop]
+        LOG.debug(_("No metadata property %s defined for the\
+                     lun %s") %(prop, self.name))
         
 class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
     """NetApp C-mode iSCSI volume driver."""
 
     def __init__(self, *args, **kwargs):
         super(NetAppCmodeISCSIDriver, self).__init__(*args, **kwargs)
-        self.discovered_luns = []
         self.lun_table = {}
-
+                
     def do_setup(self, context):
         """Setup the NetApp Volume driver.
 
@@ -1047,17 +1047,27 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         default_size = '104857600'  # 100 MB
         gigabytes = 1073741824L  # 2^30
         name = volume['name']
+        project_id = volume['project_id']
+        display_name = volume['display_name']
+        display_description = volume['display_description']
+        volume_type = self._get_volume_type(volume)
+        if volume_type:
+            pass
+        else:
+            volume_type = default_os_type
         if int(volume['size']) == 0:
             size = default_size
         else:
             size = str(int(volume['size']) * gigabytes)
-        extra_args = {'os_type':default_os_type}
+        extra_args = {'os_type':volume_type,'display_name':display_name,
+            'display_description':display_description,'project_id':project_id}
         self._provision_lun(name, size, **extra_args)
         
     def delete_volume(self, volume):
         """Driver entry point for destroying existing volumes."""
         name = volume['name']
-        self._remove_destroy_lun(name)
+        project_id = volume['project_id']
+        self._remove_destroy_lun(name, project_id)
       
     def ensure_export(self, context, volume):
         """Driver entry point to get the export info for an existing volume."""
@@ -1094,15 +1104,24 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             raise exception.NovaException(msg % volume['name'])
         lun = self._get_lun_details(lun_handle)
         if not lun:
-            raise exception.NovaException("No lun exists for the provider_location %s" %lun_handle)
-        target_map_details = self._ensure_initiator_mapped(lun.name, initiator_name, default_initiator_type)
+            raise exception.NovaException(_("No lun exists for the lun handle\
+            %s") %lun_handle)
+        target_map_details_array = self._ensure_initiator_mapped(lun.handle,
+                                     initiator_name, default_initiator_type)
+        for target_map in target_map_details_array.targetDetail:
+            target_map_details = target_map
+            break;
+        if not target_map_details:
+            msg = _('Failed to get lun target map details for the lun handle\
+                     %s')
+            raise exception.NovaException(msg % lun_handle)
         if not target_map_details.address and target_map_details.port:
-            msg = _('Failed to get target portal for provider location %s host')
+            msg = _('Failed to get target portal for the lun handle %s')
             raise exception.NovaException(msg % lun_handle)
 
         iqn = target_map_details.iqn
         if not iqn:
-            msg = _('Failed to get target IQN for provider location %s  host')
+            msg = _('Failed to get target IQN for the lun handle %s')
             raise exception.NovaException(msg % lun_handle)
 
         properties = {}
@@ -1136,10 +1155,13 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         default_initiator_type = "iscsi"
         lun_handle = volume['provider_location']
         if not lun_handle:
-            msg = ('No LUN ID for volume %s')
+            msg = _('No LUN ID for volume %s')
             raise exception.NovaException(msg % (volume['name']))
         lun = self._get_lun_details(lun_handle)
-        self._unmap_lun(lun.name, initiator_name, default_initiator_type)
+        if not lun:
+            msg = _("No lun found for handle %s")
+            raise exception.NovaException(msg %(lun.handle))
+        self._unmap_lun(lun.handle, initiator_name, default_initiator_type)
     
     def create_snapshot(self, snapshot):
         """Driver entry point for creating a snapshot.
@@ -1149,15 +1171,16 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         """
         vol_name = snapshot['volume_name']
         snapshot_name = snapshot['name']
-        lun = self._lookup_lun_for_volume(vol_name)
-        lun_name = lun.name
-        extra_args = {'space_reserved':False}
-        self._clone_lun(lun_name, snapshot_name, **extra_args)
+        project_id = snapshot['project_id']
+        lun = self._lookup_lun_for_volume(vol_name, project_id)
+        extra_args = {'space_reserved':False, 'project_id':project_id}
+        self._clone_lun(lun.handle, snapshot_name, **extra_args)
 
     def delete_snapshot(self, snapshot):
         """Driver entry point for deleting a snapshot."""
         snapshot_name = snapshot['name']
-        self._destroy_lun(snapshot_name)
+        project_id = snapshot['project_id']
+        self._destroy_lun(snapshot_name, project_id)
         
     def create_volume_from_snapshot(self, volume, snapshot):
         """Driver entry point for creating a new volume from a snapshot.
@@ -1173,17 +1196,22 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             raise exception.NovaException(msg % locals())
         vol_name = snapshot['volume_name']
         snapshot_name = snapshot['name']
-        lun = self._lookup_lun_for_volume(vol_name)
-        old_type = lun.get_type()
-        new_type = self._get_ss_type(volume)
+        project_id = snapshot['project_id']
+        lun = self._lookup_lun_for_volume(vol_name, project_id)
+        old_type = lun.get_metadata_property('os_type')
+        new_type = self._get_volume_type(volume)
         if new_type != old_type:
             msg = _('Cannot create volume of type %(new_type)s from '
                 'snapshot of type %(old_type)s')
             raise exception.NovaException(msg % locals())
         clone_name = volume['name']
-        extra_args = {'space_reserved':True}
-        clone = self._clone_lun(snapshot_name, clone_name, **extra_args)
-        self._add_lun_to_table(NetAppLun(clone.handle, clone.name, clone.size, self._create_dict_from_meta(clone.metadataArray)))
+        clone_prj_id = volume['project_id']
+        if project_id != clone_prj_id:
+            msg = _('Cannot create volume with project %(clone_prj_id) from '
+                'snapshot with project %(project_id)s')
+            raise exception.NovaException(msg % locals())
+        extra_args = {'space_reserved':True,'project_id':clone_prj_id}
+        self._clone_lun(snapshot_name, clone_name, **extra_args)
         
     def check_for_export(self, context, volume_id):
         raise NotImplementedError()
@@ -1213,7 +1241,7 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             if not getattr(FLAGS, flag, None):
                 raise exception.NovaException(_('%s is not set') % flag)
             
-    def _get_ss_type(self, volume):
+    def _get_volume_type(self, volume):
         """Get the storage service type for a volume."""
         type_id = volume['volume_type_id']
         if not type_id:
@@ -1229,8 +1257,9 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         try:
             metadata_array = self._create_metadata_list(**kwargs) 
             lun = server.provisionLun(name, size, metadata_array)
-            LOG.debug("Created lun with name %s" %name)
-            self._add_lun_to_table(NetAppLun(lun.handle, lun.name, lun.size, self._create_dict_from_meta(lun.metadataArray)))
+            LOG.debug(_("Created lun with name %s") %name)
+            self._add_lun_to_table(NetAppLun(lun.handle, lun.name,
+                 lun.size, self._create_dict_from_meta(lun.metadataArray)))
         except (WebFault, Exception):
             msg = ("Failed to create lun with name %s")
             raise exception.NovaException(msg %(name))
@@ -1238,36 +1267,30 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
     def _add_lun_to_table(self, lun):
         """Adds lun instance to list"""
         if(not isinstance(lun, NetAppLun)):
-            raise exception.NovaException("Lun not type of NetApp lun.")            
+            raise exception.NovaException(_("Lun not type of NetApp lun."))            
         self.lun_table[lun.name] = lun
-        self.discovered_luns.append(lun)
         
-    def _remove_lun_from_table(self, name):
+    def _remove_lun_from_table(self, name, project_id):
         """Removes from the driver datastructures"""
-        lun = self._lookup_lun_for_volume(name)
-        if self.lun_table.has_key(name):
+        lun = self._lookup_lun_for_volume(name, project_id)
+        if lun:
             self.lun_table.pop(name)
         else:
-            LOG.debug(("Cannot remove entry for %s from lun table. It does not exist.") %(name))
-        for lun in self.discovered_luns:
-            if lun.name == name:
-                self.discovered_luns.remove(lun)
-            else:
-                LOG.debug(("Cannot remove entry for %s from discovered luns list. It does not exist.") %(name))
-                
-    def _clone_lun(self, name, clone_name, **kwargs):
+            LOG.debug(_("Cannot remove entry for %s from lun table. It does\
+               not exist.") %(name))
+                    
+    def _clone_lun(self, handle, clone_name, **kwargs):
         """Clone lun with handle as given"""
         server = self.client.service
-        lun = self._lookup_lun_for_volume(name)
-        handle = lun.handle
         metadata = self._create_metadata_list(**kwargs)
         try:
             clone = server.cloneLun(handle, clone_name, metadata)  
-            LOG.debug(_("Clonned lun with name %s") %(name))
-            return clone
+            LOG.debug(_("Clonned lun with name %s") %(clone_name))
+            self._add_lun_to_table(NetAppLun(clone.handle, clone.name,
+                 clone.size, self._create_dict_from_meta(clone.metadataArray)))
         except (WebFault,Exception):
-            msg = ("Failed cloning for lun %s")
-            raise exception.NovaException(msg %(name))
+            msg = _("Failed cloning for lun with clone %s")
+            raise Exception(msg %(clone_name))
             
             
     def _create_metadata_list(self, **kwargs):
@@ -1280,108 +1303,112 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
             metadataArray.metadata.append(meta)
         return metadataArray  
     
-    def _map_lun(self, name, initiator_name, initiator_type="iscsi"):
+    def _map_lun(self, handle, initiator_name, initiator_type="iscsi"):
         """Map lun to to initiator on NetApp storage"""
         server = self.client.service
-        lun = self._lookup_lun_for_volume(name)
-        handle = lun.handle
         try:
             server.mapLun(handle, initiator_type, initiator_name)
-            LOG.debug(_("Mapped lun %s to the initiator %s") %(name, initiator_name))   
+            LOG.debug(_("Mapped lun with handle %s to the initiator\
+             %s") %(handle, initiator_name))   
         except:
-            msg = ("Failure mapping lun %s to the initiator %s")
-            raise exception.NovaException(msg %(name, initiator_name))
+            msg = _("Failure mapping lun with handle %s to the initiator %s")
+            raise exception.NovaException(msg %(handle, initiator_name))
         
-    def _unmap_lun(self, name, initiator_name, initiator_type="iscsi"):
+    def _unmap_lun(self, handle, initiator_name, initiator_type="iscsi"):
         """Unmap a lun from a initiator"""
         server = self.client.service
-        lun = self._lookup_lun_for_volume(name)
-        handle = lun.handle
         try:
             server.unmapLun(handle, initiator_type, initiator_name)
-            LOG.debug(_("Unmapped lun %s from the initiator %s") %(name, initiator_name))   
+            LOG.debug(_("Unmapped lun %s from the initiator\
+             %s") %(handle, initiator_name))   
         except:
-            msg = ("Failure unmapping lun %s from the initiator %s")
-            raise exception.NovaException(msg %(name, initiator_name))                   
+            msg = _("Failure unmapping lun %s from the initiator %s")
+            raise exception.NovaException(msg %(handle, initiator_name))                   
         
-    def _get_lun_target_details(self, name, initiator_name, initiator_type="iscsi"):
-        """Get the lun mapping and target details for the lun and target type"""
+    def _get_lun_target_details(self, handle, initiator_name,
+                                 initiator_type="iscsi"):
+        """Get the lun mapping and target details for the lun
+         and target type"""
         server = self.client.service
-        lun = self._lookup_lun_for_volume(name)
-        handle = lun.handle
         try:
-            target_map_list = server.getLunTargetDetails(handle, initiator_name, initiator_type) 
-            LOG.debug(_("Succesfully fetched target details for lun %s, initiator %s and target type %s") %(name, initiator_name, initiator_type))
+            target_map_list = server.getLunTargetDetails(handle, 
+                                                initiator_name, initiator_type) 
+            LOG.debug(_("Succesfully fetched target details for lun with\
+             handle %s, initiator %s and target type \
+             %s") %(handle, initiator_name, initiator_type))
             return target_map_list
         except:
-            msg = ("Failure fetching target details for lun %s, initiator name %s and target type %s")
-            raise exception.NovaException(msg %(name, initiator_name, initiator_type))
+            msg = _("Failure fetching target details for lun with handle %s,\
+             initiator name %s and target type %s")
+            raise exception.NovaException(msg %(handle, initiator_name,
+                                                 initiator_type))
         
     def _get_lun_details(self, handle):
         """Get lun based on the handle"""
-        for lun in self.discovered_luns:
+        for name in self.lun_table.keys():
+            lun = self.lun_table[name]
             if lun.handle == handle:
                 return lun
-        LOG.debug("No lun found in discovered luns for handle %s" %(handle))
+        LOG.debug(_("No lun found in discovered luns for handle %s") %(handle))
         
-    def _remove_destroy_lun(self, name):
+    def _remove_destroy_lun(self, name, project_id):
         """Remove the LUN, also destroying it.
 
         Remove the LUN from the NetApp server and destroy the actual LUN on the
         storage system.
         """
-        self._destroy_lun(name)
-        self._remove_lun_from_table(name)
+        self._destroy_lun(name, project_id)
+        self._remove_lun_from_table(name, project_id)
         
-    def _lookup_lun_for_volume(self, name):
+    def _lookup_lun_for_volume(self, name, project_id):
         """Lookup the LUN that corresponds to the given volume.
 
-        Initial lookups involve a table scan of all of the discovered LUNs,
-        but later lookups are done instantly from the hashtable.
+        Lookups involve scanning lun table for lun and project id. 
         """
-        if name in self.lun_table:
-            return self.lun_table[name]
-        for lun in self.discovered_luns:
-            if lun.name == name:
-                return lun
-        msg = ("No entry in LUN table for volume %s")
-        raise exception.NovaException(msg % (name))
+        if self.lun_table.has_key(name):
+            lun = self.lun_table[name]
+            lun_project_id = lun.get_metadata_property('project_id')
+            if lun_project_id == project_id:
+                return self.lun_table[name]
+        msg = _("No entry in LUN table for volume %s and project %s")
+        raise exception.NovaException(msg % (name, project_id))
 
     def _discover_luns(self):
         """Discover the LUNs from NetApp server.
 
         Discover all of the OpenStack-created LUNs in the NetApp server.
         """
-        self.discovered_luns = []
         self.lun_table = {}
         server = self.client.service
         try:
             luns = server.listLuns()
-            for lun in luns:
+            for lun in luns.lun:
                 name = lun.name
                 handle = lun.handle
                 size = lun.size
                 metadata_array = lun.metadataArray
-                discovered_lun = NetAppLun(handle, name, size, metadata_array)
+                discovered_lun = NetAppLun(handle, name, size,
+                                 self._create_dict_from_meta(metadata_array))
                 self._add_lun_to_table(discovered_lun)
-                LOG.debug("Success geting lun list from server")
+                LOG.debug(_("Success geting lun list from server"))
         except (WebFault, Exception):
-            msg = ("Failure discovering luns on NetApp server")
+            msg = _("Failure discovering luns on NetApp server")
             raise exception.NovaException(msg)
             
-    def _destroy_lun(self, name):
+    def _destroy_lun(self, name, project_id):
         """Destroy lun on NetApp storage"""
-        lun = self._lookup_lun_for_volume(name)
+        lun = self._lookup_lun_for_volume(name, project_id)
         handle = lun.handle
         server = self.client.service
         try:
             server.destroyLun(handle)
-            LOG.debug("Destroyed lun with name %s" %(name))
+            LOG.debug(_("Destroyed lun with name %s") %(name))
         except (suds.WebFault, Exception):
-            msg = ('Failed to remove and delete lun with name %s')
+            msg = _('Failed to remove and delete lun with name %s')
             raise exception.NovaException(msg %(name))
         
-    def _ensure_initiator_mapped(self, name, initiator_name, initiator_type = "iscsi"):
+    def _ensure_initiator_mapped(self, handle, initiator_name,
+                                  initiator_type = "iscsi"):
         """Ensure that a LUN is mapped to a particular initiator.
 
         Check if a LUN is mapped to a given initiator already and create
@@ -1390,11 +1417,14 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         in both cases.
         """
         try:
-            self._map_lun(name, initiator_name, initiator_type)
+            self._map_lun(handle, initiator_name, initiator_type)
         except WebFault:
-            LOG.debug("Seems lun %s is already mapped to the initiator %s with type %s" %(name, initiator_name, initiator_type))
+            LOG.debug(_("Seems lun with handle %s is already mapped to\
+             the initiator %s with type %s") %(handle, initiator_name,
+                                                initiator_type))
         finally:
-            lun_target_details = self._get_lun_target_details(name, initiator_name, initiator_type)
+            lun_target_details = self._get_lun_target_details(handle,
+                                             initiator_name, initiator_type)
             return lun_target_details
           
     def _get_export(self, volume):
@@ -1406,7 +1436,8 @@ class NetAppCmodeISCSIDriver(driver.ISCSIDriver):
         time (when initialize_connection() is called).
         """
         name = volume['name']
-        lun = self._lookup_lun_for_volume(name)
+        project_id = volume['project_id']
+        lun = self._lookup_lun_for_volume(name, project_id)
         return {'provider_location': lun.handle}
     
     def _create_dict_from_meta(self, metadata_array):
