@@ -993,13 +993,16 @@ class NetAppDriverTestCase(test.TestCase):
 
         
 WSDL_HEADER_CMODE = """<?xml version="1.0" encoding="UTF-8"?>
-<definitions xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:na="http://cloud.netapp.com/" 
-xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns="http://schemas.xmlsoap.org/wsdl/" 
+<definitions xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+ xmlns:na="http://cloud.netapp.com/" 
+xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+xmlns="http://schemas.xmlsoap.org/wsdl/" 
 targetNamespace="http://cloud.netapp.com/" name="CloudStorageService">
 """
 
 WSDL_TYPES_CMODE = """<types>
-<xs:schema xmlns:na="http://cloud.netapp.com/" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="1.0" 
+<xs:schema xmlns:na="http://cloud.netapp.com/" 
+xmlns:xs="http://www.w3.org/2001/XMLSchema" version="1.0" 
 targetNamespace="http://cloud.netapp.com/">
 
       <xs:element name="provisionLun">
@@ -1104,14 +1107,16 @@ targetNamespace="http://cloud.netapp.com/">
       <xs:element name="getLunTargetDetailsResult">
         <xs:complexType>
           <xs:all>
-            <xs:element name="targetDetailsArray" type="na:targetDetailsArray"/>
+            <xs:element name="targetDetailsArray" 
+            type="na:targetDetailsArray"/>
           </xs:all>
         </xs:complexType>
       </xs:element>
 
       <xs:complexType name="stringArray">
         <xs:sequence>
-          <xs:element name="item" type="xs:string" minOccurs="0" maxOccurs="unbounded" nillable="true"/>
+          <xs:element name="item" type="xs:string" minOccurs="0" 
+          maxOccurs="unbounded" nillable="true"/>
         </xs:sequence>
       </xs:complexType>
       <xs:complexType name="metadata">
@@ -1122,7 +1127,8 @@ targetNamespace="http://cloud.netapp.com/">
       </xs:complexType>
       <xs:complexType name="metadataArray">
         <xs:sequence>
-          <xs:element name="metadata" type="na:metadata" minOccurs="0" maxOccurs="unbounded" />
+          <xs:element name="metadata" type="na:metadata" minOccurs="0" 
+          maxOccurs="unbounded" />
         </xs:sequence>
       </xs:complexType>
       <xs:complexType name="lun">
@@ -1135,7 +1141,8 @@ targetNamespace="http://cloud.netapp.com/">
       </xs:complexType>
       <xs:complexType name="lunArray">
         <xs:sequence>
-          <xs:element name="lun" type="na:lun" minOccurs="0" maxOccurs="unbounded" nillable="true"/>
+          <xs:element name="lun" type="na:lun" minOccurs="0" 
+          maxOccurs="unbounded" nillable="true"/>
         </xs:sequence>
       </xs:complexType>
       <xs:complexType name="targetDetail">
@@ -1149,7 +1156,8 @@ targetNamespace="http://cloud.netapp.com/">
       </xs:complexType>
       <xs:complexType name="targetDetailsArray">
         <xs:sequence>
-          <xs:element name="targetDetail" type="na:targetDetail" maxOccurs="unbounded" nillable="true"/>
+          <xs:element name="targetDetail" type="na:targetDetail" 
+          maxOccurs="unbounded" nillable="true"/>
         </xs:sequence>
       </xs:complexType>
      </xs:schema></types>"""
@@ -1162,7 +1170,8 @@ WSDL_TRAILER_CMODE = """<service name="CloudStorageService">
 </definitions>"""
 
 RESPONSE_PREFIX_CMODE = """<?xml version='1.0' encoding='UTF-8'?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body>"""
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+<soapenv:Body>"""
 
 RESPONSE_SUFFIX_CMODE = """</soapenv:Body></soapenv:Envelope>"""
 
@@ -1241,14 +1250,16 @@ class FakeCMODEServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return
         api = tag[(2 + len(ntap_ns)):]
         if 'provisionLun' == api:
-            body = """<ns:provisionLunResult xmlns:ns="http://cloud.netapp.com/">
+            body = """<ns:provisionLunResult xmlns:ns=
+            "http://cloud.netapp.com/">
             <lun><name>lun1</name><size>20</size>
              <handle>1d9c006c-a406-42f6-a23f-5ed7a6dc33e3</handle>
             <metadataArray><metadata><key>os</key> 
             <value>linux</value></metadata></metadataArray></lun>
             </ns:provisionLunResult>"""
         elif 'destroyLun' == api:
-            body = """<ns:destroyLunResult xmlns:ns="http://cloud.netapp.com/" />"""
+            body = """<ns:destroyLunResult xmlns:ns="http://cloud.netapp.com/"
+             />"""
         elif 'cloneLun' == api:
             body = """<ns:cloneLunResult xmlns:ns="http://cloud.netapp.com/">
                      <lun><name>lun2</name><size>2</size> 
@@ -1257,9 +1268,11 @@ class FakeCMODEServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                      <value>linux</value></metadata>
                      </metadataArray></lun></ns:cloneLunResult>"""
         elif 'mapLun' == api:
-            body = """<ns1:mapLunResult xmlns:ns="http://cloud.netapp.com/" />"""
+            body = """<ns1:mapLunResult xmlns:ns="http://cloud.netapp.com/"
+             />"""
         elif 'unmap' == api:
-            body = """<ns1:unmapLunResult xmlns:ns="http://cloud.netapp.com/" />"""
+            body = """<ns1:unmapLunResult xmlns:ns="http://cloud.netapp.com/"
+             />"""
         elif 'listLuns' == api:
             body = """<ns:listLunsResult xmlns:ns="http://cloud.netapp.com/">
                  <luns>
@@ -1272,7 +1285,8 @@ class FakeCMODEServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                  </luns>
                  </ns:listLunsResult>"""
         elif 'getLunTargetDetails' == api:
-            body = """<ns:getLunTargetDetailsResult xmlns:ns="http://cloud.netapp.com/">
+            body = """<ns:getLunTargetDetailsResult 
+            xmlns:ns="http://cloud.netapp.com/">
                     <targetDetailsArray>
                     <targetDetail>
                      <address>1.2.3.4</address> 
@@ -1342,7 +1356,8 @@ class NetAppCmodeISCSIDriverTestCase(test.TestCase):
               'display_description':'lun1'}
     snapshot = {'name':'lun2','size':1,'volume_name':'lun1',
                 'volume_size':1,'project_id':'project'}
-    volume_sec = {'name':'vol_snapshot','size':1,'volume_name':'lun1','os_type':'linux',
+    volume_sec = {'name':'vol_snapshot','size':1,'volume_name':'lun1',
+                  'os_type':'linux',
               'provider_location':'lun1','id':'lun1','provider_auth':None,
               'project_id':'project','display_name':None,
               'display_description':'lun1'}
@@ -1351,7 +1366,8 @@ class NetAppCmodeISCSIDriverTestCase(test.TestCase):
         super(NetAppCmodeISCSIDriverTestCase, self).setUp()
         driver = netapp.NetAppCmodeISCSIDriver()
         self.stubs.Set(httplib, 'HTTPConnection', FakeCmodeHTTPConnection)
-        driver._create_client(wsdl_url='http://localhost:8080/axis2/services/CloudStorageService?wsdl',
+        driver._create_client(wsdl_url=
+            'http://localhost:8080/axis2/services/CloudStorageService?wsdl',
                               login='root', password='password',
                               hostname='localhost', port=8080, cache=False)
         self.driver = driver
@@ -1376,7 +1392,8 @@ class NetAppCmodeISCSIDriverTestCase(test.TestCase):
         self.assertTrue(updates['provider_location'])
         self.volume['provider_location'] = updates['provider_location']
         connector = {'initiator':'init1'}
-        connection_info = self.driver.initialize_connection(self.volume, connector)
+        connection_info = self.driver.initialize_connection(self.volume,
+                                                             connector)
         self.assertEqual(connection_info['driver_volume_type'], 'iscsi')
         properties = connection_info['data']
         self.driver.terminate_connection(self.volume, connector)
